@@ -1,11 +1,11 @@
 # PrediMaint — guide fonctionnel et technique des acteurs
 
 Ce document décrit les fonctionnalités effectivement présentes dans le dépôt pour
-l’**Administrateur système**, le **Technicien de maintenance** et le
-**Responsable de maintenance**, ainsi que leurs principaux composants, API, données,
-permissions et méthodes de validation. Il précise également l’état actuel et le
-périmètre prévu pour le **Directeur de production** : son rôle existe, mais son
-espace dédié et ses indicateurs spécifiques restent à développer.
+l’**Administrateur système**, le **Technicien de maintenance**, le
+**Responsable de maintenance** et le **Directeur de production**, ainsi que leurs
+principaux composants, API, données, permissions et méthodes de validation. Les
+indicateurs nécessitant des données industrielles encore absentes sont signalés
+comme indisponibles; ils ne sont pas présentés comme des résultats de production.
 
 Il complète [README.md](README.md) et le guide de lancement/test
 [README_RELEASE_1.md](README_RELEASE_1.md). Les règles de sécurité sont appliquées
@@ -128,8 +128,9 @@ docker compose up -d --force-recreate backend
 
 L’administrateur système gère les comptes et les rôles, consulte les journaux
 d’accès et d’activité, traite les notifications et gère son propre profil et ses
-préférences. Il ne remplace pas le Responsable de maintenance pour la gestion du
-parc, des capteurs et des interventions.
+préférences. Il peut aussi enregistrer le remplacement traçable d’un capteur
+défectueux. La gestion courante du parc et des interventions reste au Responsable
+de maintenance.
 
 Le préfixe de toutes les routes d’administration est `/api/admin`. Les handlers de
 `backend/app/api/admin.py` appliquent `require_roles("admin")` ; les pages du menu ne
@@ -146,6 +147,8 @@ sont donc pas accessibles aux autres rôles par simple appel HTTP.
 | Historique des connexions | Examiner les événements, adresses IP, dates et résultats succès/échec |
 | Journal d’activité | Examiner les opérations administratives et leurs cibles |
 | Notifications | Voir les notifications de compte, l’état d’envoi et les alertes système récentes |
+| Sauvegardes PostgreSQL | Créer et télécharger des sauvegardes, consulter l’historique et configurer l’automatisation |
+| Remplacement de capteur | Choisir une machine et un capteur actif, saisir le nouveau capteur et le motif, consulter l’historique |
 | Mon profil | Mettre à jour ses coordonnées et modifier son mot de passe |
 | Paramètres | Enregistrer les préférences disponibles : notifications par courriel, langue et durée de session |
 
@@ -198,6 +201,13 @@ Les routes sont relatives au préfixe `/api/admin` :
 | `GET /login-history` | Historique des connexions, filtrable par courriel |
 | `GET /activity` | Journal des activités administratives |
 | `GET /notifications` | Notifications de comptes et alertes système |
+| `GET /sensors` | Capteurs et machines pour le formulaire de remplacement |
+| `POST /machines/{machine_id}/sensors/{sensor_id}/replace` | Désactiver l’ancien capteur, créer le nouveau et journaliser l’opération |
+| `GET /sensor-replacements` | Historique des remplacements avec motif, date et administrateur |
+| `GET /backups` | Historique récent, dernier statut et prochaine exécution |
+| `POST /backups` | Créer et vérifier un dump PostgreSQL manuel |
+| `GET /backups/{backup_id}/download` | Télécharger une sauvegarde réussie |
+| `GET /backups/config`, `PUT /backups/config` | Lire et configurer la sauvegarde automatique |
 | `GET /profile`, `PATCH /profile` | Lire et modifier le profil administrateur |
 | `POST /profile/password` | Changer son mot de passe |
 | `GET /settings`, `PUT /settings` | Lire et enregistrer les préférences |
@@ -208,6 +218,32 @@ enregistrées dans `system_settings`. La durée de session choisie est utilisée
 l’émission des prochains JWT ; les jetons déjà émis gardent leur expiration
 existante. Les contrôles système ne remplacent pas la configuration du serveur
 (SMTP, JWT, base de données).
+
+La sauvegarde automatique est activée par défaut à 1 440 minutes (24 heures).
+L’intervalle configurable est compris entre 1 et 525 600 minutes. Les dumps au
+format custom sont créés par `pg_dump`, vérifiés par `pg_restore --list` et stockés
+dans le volume Docker indépendant `predimaint_backups`. Les métadonnées et la
+fréquence sont persistées en base. Les routes de sauvegarde sont réservées au rôle
+`admin`; les secrets PostgreSQL ne sont jamais transmis au navigateur.
+Les anciennes sauvegardes ne sont pas supprimées automatiquement; surveillez
+l’espace disponible et appliquez une politique d’archivage conforme à vos règles
+de conservation. Les archives contiennent des données sensibles.
+
+### US-37 — Remplacement d’un capteur
+
+Le remplacement est réservé au rôle `admin` et ne supprime pas l’ancien capteur.
+L’opération désactive l’ancien capteur et crée un nouveau capteur actif sur la
+même machine et pour la même grandeur, dans une transaction. Une contrainte unique
+ne permet qu’un capteur actif par grandeur et machine; plusieurs anciens capteurs
+désactivés sont conservés. Le motif, l’horodatage serveur, l’administrateur et les
+identifiants des deux capteurs sont consultables dans l’historique.
+
+Les nouvelles mesures physiques sont reliées au capteur actif par grandeur dans
+`measurement_sensor_sources` et l’API de télémétrie expose cette information sous
+`sensor_ids`. Les mesures stockées avant cette traçabilité restent intactes mais
+sans attribution de capteur : leur source historique ne peut pas être déduite des
+seules lignes de mesures. Les mesures simulées ne sont pas associées à des
+capteurs physiques.
 
 ### Données et code concernés
 
@@ -221,6 +257,11 @@ existante. Les contrôles système ne remplacent pas la configuration du serveur
 | Gestion API administrateur et règles de validation | `backend/app/api/admin.py` |
 | Authentification, JWT et autorisation par rôle | `backend/app/api/auth.py` |
 | Envoi SMTP | `backend/app/infrastructure/notifications.py` |
+| Création `pg_dump`, planification et vérification `pg_restore` | `backend/app/infrastructure/database_backups.py` |
+| Métadonnées de sauvegarde | `DatabaseBackupRow` dans `backend/app/infrastructure/models.py` |
+| Fichiers persistants, séparés de PostgreSQL | Volume Docker `predimaint_backups`, monté dans le backend à `/var/lib/predimaint/backups` |
+| Remplacement de capteur et historique | `SensorReplacementRow`, routes `backend/app/api/admin.py` et formulaire `backend/app/static/admin.js` |
+| Provenance des mesures physiques | `MeasurementSensorSourceRow` et `backend/app/infrastructure/repository.py` |
 
 ---
 
@@ -244,11 +285,11 @@ serveur.
 |---|---|
 | Vue d’ensemble | Nombre de machines autorisées/en ligne, alertes actives, interventions à suivre et dernière mesure reçue |
 | Mes alertes | Consulter les alertes des machines accessibles, filtrer et prendre en charge une nouvelle alerte |
-| Mes interventions | Lire les consignes, échéances et priorités ; mettre à jour l’état, le diagnostic, le travail effectué et le résultat |
-| Mes machines | Consulter les machines autorisées et leur état |
+| Mes interventions | Historique complet des statuts attribué/accepté/en cours/terminé/annulé, filtre par état, compte rendu détaillé et photos |
+| Mes machines | Consulter les machines autorisées, leur fiche détaillée, leurs capteurs, dernières mesures, alertes et besoin d’intervention |
 | Mesures des capteurs | Choisir machine, grandeur et période ; consulter minimum, maximum, moyenne, valeurs au-dessus du seuil, graphique et tableau |
 | Historique des pannes | Consulter les événements critiques, filtrer et enregistrer diagnostic, intervention et résultat |
-| Notifications | Lire les notifications qui lui sont adressées et marquer une notification comme lue |
+| Notifications | Lire et marquer les notifications comme lues; activer les notifications navigateur si le serveur est configuré en Web Push |
 | Mode hors ligne | Préparer localement des comptes rendus autorisés et les synchroniser ultérieurement |
 | Calibration | Enregistrer machine, capteur, valeur de référence, valeur mesurée et observations |
 | Mon profil | Modifier ses coordonnées et son mot de passe |
@@ -282,12 +323,81 @@ Les interventions sont liées à une machine et à un Technicien affecté. Les �
 gérés comprennent `assigned`, `accepted`, `in_progress`, `completed` et `cancelled`.
 Le Technicien peut renseigner l’état et les champs de suivi qui lui sont permis ;
 il ne peut pas réattribuer l’intervention ni en modifier les données de gestion.
+Une mission apparaît dans « Mes interventions » après son attribution par le
+Responsable. Le formulaire de diagnostic dans « Historique des pannes » met à jour
+l’événement critique et ne crée pas de mission planifiée. De même, « Prendre en
+charge » sur une alerte enregistre son état et sa date, sans créer automatiquement
+une intervention.
 
 La mise à jour utilise une révision serveur (`revision` / `expected_revision`) pour
 empêcher l’écrasement silencieux d’une modification concurrente. Le client hors ligne
 associe une opération à un `client_action_id` afin que sa répétition ne duplique pas
 l’action. Le serveur refuse les transitions de statut non permises ; le travail
 effectué est requis pour terminer une intervention.
+
+La liste du Technicien n’applique pas le plafond de 300 éléments utilisé pour les
+autres rôles : tous ses enregistrements autorisés restent consultables après une
+reconnexion. Le filtre d’état ne supprime ni n’archive les autres interventions.
+Les comptes rendus terminés affichent le diagnostic, le travail réalisé, le
+résultat et la date de clôture.
+
+### Fiche machine et photos d’intervention
+
+Dans « Mes machines », ouvrez **Ouvrir la fiche détaillée** pour afficher les
+dernières valeurs réellement stockées, les capteurs déclarés (actifs et inactifs),
+les alertes/anomalies en cours et le nombre d’interventions actives qui vous sont
+attribuées. Le backend revérifie l’accès à la machine pour chaque requête.
+
+Dans une intervention, ouvrez **Photos de l’intervention** pour joindre ou
+consulter des images JPEG, PNG ou WebP (8 Mio maximum par fichier). Le type est
+déduit du contenu du fichier, le nom de stockage est généré par le serveur et les
+routes de liste/téléchargement vérifient l’accès à l’intervention. Les fichiers
+sont dans le volume Docker indépendant `predimaint_intervention_photos`, distinct
+de `postgres_data` et `predimaint_backups`; cette configuration conserve les
+fichiers lors d’un redémarrage normal des conteneurs, à vérifier dans
+l’environnement déployé. Il n’existe pas de suppression de photo depuis
+l’interface. Le `pg_dump` de la base ne contient pas les octets des photos : le
+volume de photos doit être sauvegardé séparément si cette exigence s’applique.
+
+### Web Push et délais d’alerte
+
+Les notifications internes persistent et restent visibles sans configuration
+Web Push. Pour recevoir une notification système lorsque l’application est en
+arrière-plan, configurez `WEB_PUSH_VAPID_PUBLIC_KEY`,
+`WEB_PUSH_VAPID_PRIVATE_KEY` (PEM encodé en Base64 avec préfixe `base64:`) et
+`WEB_PUSH_VAPID_SUBJECT` dans le `.env` local, puis recréez le backend. La clé
+privée reste côté serveur; l’API remet au navigateur uniquement la clé publique.
+L’inscription est réservée au compte Technicien courant et limitée aux hôtes
+publics des services Push courants (Google FCM, Mozilla, Windows et Apple). Le
+navigateur doit prendre en charge Push et autoriser les notifications; `localhost`
+est un contexte sécurisé de développement, tandis qu’un déploiement public doit
+utiliser HTTPS. Sans clés valides et sans test dans un navigateur réel, ne
+considérez pas la livraison Web Push comme vérifiée.
+
+Générez une paire localement avec l’environnement Python du projet, copiez les
+deux valeurs dans le `.env` non versionné et remplacez l’adresse de contact :
+
+```powershell
+& .\.venv\Scripts\python.exe -c "import base64; from py_vapid import Vapid; from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat; v=Vapid(); v.generate_keys(); public=base64.urlsafe_b64encode(v.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)).rstrip(b'='); print('WEB_PUSH_VAPID_PUBLIC_KEY='+public.decode()); print('WEB_PUSH_VAPID_PRIVATE_KEY=base64:'+base64.b64encode(v.private_pem()).decode())"
+```
+
+Après avoir mis les trois variables `WEB_PUSH_VAPID_*` dans `.env`, reconstruisez
+uniquement le backend, sans supprimer les volumes :
+
+```powershell
+docker compose up -d --build --force-recreate backend
+```
+
+Les délais sont horodatés sans inventer d’heure d’acquisition : le firmware
+MicroPython actuel n’envoie pas d’horodatage de lecture. `received_at` indique
+l’arrivée au backend, `processing_delay_ms` mesure le traitement backend jusqu’à
+la création de l’événement d’alerte, `push_sent_at` indique l’acceptation par le
+service Push et `received_at` des notifications est renseigné quand l’application
+Technicien confirme leur réception. Les événements historiques antérieurs à ces
+colonnes gardent des mesures nulles, jamais reconstituées. Aucun SLA maximal
+n’est défini; une cible de **30 secondes entre détection et réception par
+l’application** peut être proposée pour validation, mais n’est pas appliquée comme
+un seuil automatique.
 
 ### Mode hors ligne et synchronisation
 
@@ -298,12 +408,15 @@ statique de l’application ; il ne met pas en cache les routes `/api`.
 En absence de réseau :
 
 1. seules les données précédemment obtenues et autorisées peuvent être consultées ;
-2. un compte rendu hors ligne est un brouillon local, conservé avec une clé d’action,
+2. un compte rendu hors ligne ne peut être préparé que pour une intervention ouverte
+   déjà attribuée au Technicien ; sans mission attribuée, le formulaire n’est pas
+   proposé et l’interface indique de contacter le Responsable ;
+3. un compte rendu hors ligne est un brouillon local, conservé avec une clé d’action,
    une révision attendue et l’identifiant de l’intervention ;
-3. l’interface indique explicitement que le brouillon n’est pas encore enregistré
+4. l’interface indique explicitement que le brouillon n’est pas encore enregistré
    sur le serveur ;
-4. lorsque le réseau revient, le Technicien peut synchroniser ;
-5. en cas de révision obsolète, le conflit est affiché et doit être examiné avant
+5. lorsque le réseau revient, le Technicien peut synchroniser ;
+6. en cas de révision obsolète, le conflit est affiché et doit être examiné avant
    de préparer une nouvelle synchronisation.
 
 Les brouillons sont locaux au navigateur/appareil : ne videz pas les données du site
@@ -331,6 +444,7 @@ machine autorisée.
 |---|---|
 | `GET /technician/overview` | Indicateurs du tableau Technicien |
 | `GET /machines` | Machines visibles pour le compte |
+| `GET /machines/{machine_id}/details` | Fiche et données récentes d’une machine autorisée |
 | `GET /machines/{machine_id}/telemetry` | Mesures filtrées par date/période |
 | `GET /machines/{machine_id}/sensors` | Capteurs d’une machine autorisée |
 | `GET /alerts` | Alertes visibles |
@@ -338,9 +452,16 @@ machine autorisée.
 | `GET /alerts/{alert_id}/history` | Historique d’une alerte |
 | `GET /interventions` | Interventions accessibles au compte |
 | `PATCH /interventions/{intervention_id}` | Mettre à jour le suivi selon le rôle |
+| `GET /interventions/{intervention_id}/photos` | Lister les photos d’une intervention accessible |
+| `POST /interventions/{intervention_id}/photos` | Joindre une photo à une intervention accessible |
+| `GET /interventions/{intervention_id}/photos/{photo_id}` | Afficher une photo après vérification de l’accès |
 | `GET /failures`, `PATCH /failures/{failure_id}` | Lire et diagnostiquer les événements critiques |
 | `GET /calibrations`, `POST /calibrations` | Lire et consigner les calibrations |
 | `GET /notifications` | Notifications du Technicien |
+| `GET /notifications/push/vapid-key` | État Push et clé publique uniquement |
+| `POST /notifications/push/subscriptions` | Enregistrer l’abonnement Push du Technicien courant |
+| `DELETE /notifications/push/subscriptions` | Retirer cet abonnement Push |
+| `POST /notifications/received` | Horodater l’accusé de réception par l’application |
 | `POST /notifications/{notification_id}/read` | Marquer une notification comme lue |
 | `GET /profile`, `PATCH /profile` | Lire et modifier ses coordonnées |
 | `POST /profile/password` | Changer son mot de passe |
@@ -364,22 +485,63 @@ capteur et seuil. Le Technicien n’a pas accès à ces opérations de gestion.
 | Affectations, mesures, alertes, événements et notifications | `backend/app/infrastructure/models.py` |
 | Ingestion MQTT, alertes et génération d’événements/notifications | `backend/app/infrastructure/mqtt_client.py`, `backend/app/infrastructure/repository.py` |
 | Mise en cache du shell hors ligne | `backend/app/static/service-worker.js` |
+| Photos d’intervention et abonnements Push | `backend/app/infrastructure/models.py`, `backend/app/infrastructure/web_push.py` |
 
 ---
 
 ## 4. Acteur 3 — Responsable de maintenance
 
-Le compte `manager` utilise désormais une interface dédiée avec une barre latérale
-et une navigation sans rechargement. Les pages regroupent la vue d’ensemble, les
-alertes, les interventions, le parc et les capteurs, les seuils, la performance et
-le profil. Elles s’appuient sur les API existantes et ne donnent pas accès aux routes
-réservées à l’Administrateur.
+Le compte `manager` utilise une interface dédiée avec une barre latérale et une
+navigation sans rechargement. Les pages comprennent la vue d’ensemble, les alertes,
+les interventions, le parc et les capteurs, la comparaison de machines, les seuils,
+la performance et le profil. Les opérations sensibles sont également limitées par
+rôle côté API.
 
-La vue Performance n’affiche pas de chiffres illustratifs comme des résultats
-observés : disponibilité, MTBF et MTTR restent indisponibles tant que les arrêts
-planifiés, les arrêts confirmés et les reprises ne sont pas historisés de façon
-fiable. La couverture minimum convenue avant de présenter ces indicateurs est de
-95 %.
+### Performance, transitions et conventions
+
+`GET /api/manager/performance?period=24h|7d|30d` calcule les indicateurs à partir
+des transitions d’état persistées et des pannes déclarées par un Responsable. Le
+tableau de bord est actualisé quand la page est visible, au rythme du rafraîchissement
+du dashboard (5 secondes).
+
+La disponibilité présentée est la **disponibilité de supervision MQTT**, et non
+une disponibilité mécanique : `temps en ligne / temps observé × 100`. Une période
+est observée seulement après le premier état connu; les périodes inconnues sont
+exclues du numérateur et du dénominateur, et la couverture (temps observé / temps
+depuis la création des machines) les rend visibles. Les indicateurs de
+disponibilité sont qualifiés de suffisants uniquement à partir de 95 % de couverture.
+Les événements antérieurs à l’ajout de l’historique ne sont pas reconstruits.
+
+Les messages MQTT `online`/`offline` (y compris le Last Will du firmware) et les
+mesures qui font passer une machine en ligne ajoutent un événement uniquement quand
+l’état change. Le nombre de pannes mécaniques est distinct : il compte les pannes
+déclarées manuellement par le Responsable, pas chaque mesure anormale ni chaque
+perte de communication. La clôture d’une panne enregistre diagnostic, travaux,
+résultat et heure de rétablissement. MTBF suit la convention du TD
+`temps en ligne / nombre de pannes confirmées`; MTTR est la moyenne des durées entre
+déclaration et rétablissement. Ces durées sont à interpréter avec la couverture et
+les historiques disponibles.
+
+La cible SLA n’est pas préconfigurée. Le Responsable peut l’enregistrer depuis la
+page Performance via `PUT /api/manager/performance/sla`; le temps hors ligne toléré
+est calculé par `(1 - cible) × durée de la période`. Une couverture insuffisante
+empêche de déclarer l’objectif respecté ou dépassé.
+
+La page permet aussi de filtrer les alertes par origine et statut, consulter leur
+historique, marquer une fausse alerte, enregistrer une panne confirmée et confirmer
+son rétablissement. `POST /api/manager/alerts/{id}/false-positive`,
+`POST /api/manager/failures`, `GET /api/manager/failures` et
+`PATCH /api/manager/failures/{id}/resolve` sont réservés au rôle Responsable.
+Les fausses alertes restent consultables dans l’historique, mais ne sont plus
+comptées comme alertes actives. La comparaison de machines lit les dernières
+mesures par machine et mode à partir des API télémétrie/seuils existantes; elle ne
+fabrique pas de mesures absentes.
+
+Limites : les maintenances planifiées et le planning de production ne sont pas
+encore historisés; elles ne peuvent donc pas être exclues du SLA. Les pannes et
+réparations saisies par le Responsable sont des déclarations métier, pas une preuve
+automatique de remise en service. Les indicateurs nouvellement déployés ne peuvent
+pas couvrir rétroactivement les transitions antérieures.
 
 Le formulaire de profil partagé avec le Technicien est implémenté dans
 `backend/app/static/profile.js`. Les deux espaces réutilisent `GET /api/profile`,
@@ -394,6 +556,44 @@ reconnecter avec le nouveau mot de passe. Le test API
 `test_manager_can_update_own_profile_and_password_without_admin_access` vérifie
 l’accès au profil, le refus du profil Administrateur et la révocation de session.
 
+### Vérification manuelle et tests
+
+Les tests `test_manager_performance_*`, `test_manager_manual_failure_creation_recovery_and_role_restrictions`,
+`test_manager_marks_false_alert_and_history_excludes_it_from_active_count` et
+`test_mqtt_status_transitions_are_recorded_once_for_repeated_status` couvrent
+respectivement disponibilité/MTBF/MTTR/SLA, pannes, fausses alertes et transitions
+MQTT sans doublon. Le scénario de disponibilité multi-machines vérifie l’agrégation
+par temps total et non par moyenne des pourcentages.
+
+Dans l’interface, connectez-vous avec un Responsable puis vérifiez :
+
+1. **Vue d’ensemble** : état en ligne/hors ligne, alertes et mesures. Changez de
+   mode Réel/Simulé et confirmez que l’origine reste indiquée.
+2. **Seuils d’alerte** : choisissez une machine et une grandeur; enregistrez un
+   seuil avertissement inférieur au seuil critique. Vérifiez le message de succès
+   puis rechargez pour vérifier que les deux valeurs sont relues depuis l’API.
+3. **Alertes** : filtrez par origine et statut; ouvrez l’historique; acquittez ou
+   clôturez une alerte de test. Pour une alerte active de test, marquez-la fausse
+   et confirmez qu’elle apparaît sous le filtre « Fausse alerte » mais plus dans
+   le total actif. Les actions modifient l’état partagé de l’alerte.
+4. **Interventions** : attribuez une intervention à un compte Technicien actif,
+   avec échéance; vérifiez qu’elle apparaît dans le suivi Responsable et dans
+   « Mes interventions » du technicien assigné.
+5. **Pannes** : déclarez un incident explicitement identifié comme test. Vérifiez
+   son auteur et son heure; saisissez diagnostic, travaux et résultat pour
+   confirmer le rétablissement. L’action est persistée et ne doit être effectuée
+   que pour une panne réellement terminée.
+6. **Comparer des machines** : choisissez au moins deux machines et un mode; sans
+   télémétrie dans ce mode, l’interface doit indiquer l’absence de mesure plutôt
+   que d’afficher un zéro.
+7. **Performance** : vérifiez la période, l’heure d’actualisation, la couverture,
+   les transitions connues et la configuration SLA. Les transitions anciennes
+   absentes ne sont pas estimées.
+
+Pour les essais destructifs ou les changements d’état d’alertes/pannes, utilisez
+une base de test ou des éléments explicitement créés pour les essais; ne requalifiez
+pas un incident de production.
+
 ---
 
 ## 5. Acteur 4 — Directeur de production
@@ -407,20 +607,19 @@ d’administration. Après authentification, `app.js` ouvre `#director-app` et
 
 | Page | Fonctionnalités livrées |
 |---|---|
-| Vue d’ensemble | Machines actives, dernier état connu, alertes actives et événements critiques récents |
-| Indicateurs de disponibilité | État enregistré des machines et explications d’indisponibilité pour disponibilité, couverture, MTBF et MTTR |
-| Durée et fréquence des pannes | Répartition et historique des événements critiques, sans les déclarer pannes confirmées |
-| Rapports de maintenance | Synthèse filtrée, interventions et événements enregistrés, export CSV et impression/enregistrement PDF du navigateur |
-| Coût des arrêts | État non configuré et liste des paramètres économiques requis ; aucun montant inventé |
+| Vue d’ensemble | Disponibilité de supervision, couverture, état MQTT, télémétrie obsolète, alertes et événements récents |
+| Indicateurs de disponibilité | Disponibilité basée sur les intervalles de télémétrie fraîche; couverture observée, périodes sans données et MTBF/MTTR des pannes confirmées |
+| Durée et fréquence des pannes | Séparation des dépassements critiques et des pannes confirmées; durée d’arrêt et fréquence normalisée sur 30 jours |
+| Rapports de maintenance | Synthèse filtrée incluant disponibilité, pannes, coûts estimés, interventions, export CSV et impression/enregistrement PDF |
+| Coût des arrêts | Configuration du tarif horaire par machine, historique des modifications et estimation par devise des arrêts confirmés |
 | Vue globale des machines | Parc actif, dernier état enregistré et dernière mesure |
 | Notifications | Notifications personnelles et action pour les marquer comme lues |
 | Mon profil | Formulaire partagé pour modifier ses coordonnées et son mot de passe |
 
 Le menu latéral est fixe sur grand écran et devient rétractable sur mobile. Les
 pages utilisent la palette commune et les styles de tableau s’adaptent à l’espace
-disponible. Les ressources et le service worker sont versionnés en `v9` ; le shell
-précache `director.js` afin d’éviter que le navigateur ne conserve l’ancien
-parcours générique.
+disponible. Les ressources et le service worker sont versionnés en `v27` ; le shell
+précache les modules partagés et les espaces par rôle.
 
 ### Périodes, données et indicateurs
 
@@ -429,22 +628,29 @@ Les pages de synthèse, rapports et événements proposent les périodes 7, 30, 
 données SQL persistées ; les requêtes de rapports limitent chacun des historiques
 à 300 lignes et signalent cette limite.
 
-Les modèles existants ne contiennent ni planning de production, ni périodes d’arrêt
-confirmées, ni paramètres économiques. En conséquence :
+Les indicateurs sont recalculés à chaque consultation et la page active se
+rafraîchit automatiquement toutes les 10 secondes. Le seuil d’obsolescence est
+configurable par l’Administrateur dans les paramètres système
+(5–3600 secondes, valeur initiale 30). La disponibilité affichée est une métrique
+de **supervision**, pas une disponibilité mécanique : les intervalles de
+télémétrie fraîche comptent comme observés/en ligne, les périodes MQTT hors ligne
+et les périodes sans mesure fraîche comptent comme indisponibles. La couverture
+sépare les durées observées des durées sans état exploitable. Les événements
+MQTT antérieurs à leur historisation ne peuvent pas être reconstruits.
 
-- disponibilité, couverture, MTBF et MTTR sont explicitement « non disponibles » ;
-- une alerte ou une ligne `MaintenanceFailureRow` est présentée comme événement
-  critique à examiner, pas comme panne confirmée ;
-- une mesure absente ou un état sans mesure est montré comme inconnu ;
-- le retour d’une mesure sous le seuil n’est pas assimilé à une réparation ;
-- aucune durée ou coût d’arrêt n’est déduit des événements actuels ;
-- les durées d’intervention affichées sont celles déclarées pour l’intervention,
-  pas une durée d’indisponibilité de la machine.
+Les pannes confirmées proviennent de `ManagerFailureRow`; les alertes et
+`MaintenanceFailureRow` restent des dépassements de seuil distincts. La durée
+d’arrêt et les coûts utilisent les intervalles confirmés, sans compter deux fois
+les chevauchements sur une même machine. Le MTBF reste non calculable sans panne
+confirmée ou sans durée de fonctionnement observée; le MTTR reste non calculable
+sans rétablissement enregistré. Aucune moyenne n’est remplacée par zéro.
 
-La page « Coût des arrêts » expose les informations à configurer (coût horaire,
-cadence/valeur de production et convention de calcul), mais ne modifie pas ces
-paramètres. Tout futur calcul devra distinguer une estimation d’un coût réel et
-reposer sur une durée d’arrêt confirmée.
+Le Directeur peut enregistrer un tarif horaire par machine et une devise ISO. Le
+backend conserve chaque changement avec l’heure et l’identité du Directeur. Les
+coûts sont des estimations « durée confirmée × tarif » et les devises sont
+totalisées séparément. Sans tarif, l’interface indique la durée non tarifée et
+« Tarif à renseigner »; aucun tarif global ou montant réel n’est inventé. Les
+durées d’intervention affichées restent distinctes des arrêts machine.
 
 ### API et contrôle d’accès
 
@@ -453,9 +659,13 @@ Toutes ses routes utilisent `require_roles("director")` :
 
 | Méthode et route | Données retournées |
 |---|---|
-| `GET /api/director/overview?days=30&machine_id=...` | Parc actif, états enregistrés, alertes, événements de la période et indicateurs indisponibles explicitement |
+| `GET /api/director/overview?days=30&machine_id=...` | Parc actif, disponibilité/couverture, fraîcheur télémétrique, pannes confirmées et coûts |
 | `GET /api/director/events?days=30&machine_id=...&limit=100` | Événements critiques, état du seuil et dates |
-| `GET /api/director/report?days=30&machine_id=...` | Résumé, interventions et événements, avec plafond de 300 lignes par liste |
+| `GET /api/director/report?days=30&machine_id=...` | Indicateurs, coûts, interventions, pannes confirmées et événements (300 lignes max. par liste) |
+| `GET /api/director/costs?days=30&machine_id=...` | Durées d’arrêt et estimations de coût par devise |
+| `GET /api/director/cost-rates` | Tarif courant (ou non configuré) pour chaque machine active |
+| `PUT /api/director/machines/{machine_id}/cost-rate` | Enregistrer un nouveau tarif, avec identité et horodatage |
+| `GET /api/director/cost-rates/history?machine_id=...` | Historique des tarifs et responsables de modification |
 | `GET /api/machines` | Liste des machines actives pour alimenter le filtre |
 | `GET /api/notifications` | Notifications du compte |
 | `POST /api/notifications/{notification_id}/read` | Marquer comme lue une notification appartenant au compte |
@@ -501,8 +711,8 @@ nouveau module et sa version apparaissent dans le shell et le service worker.
 5. Marquez une notification comme lue, puis vérifiez son état après rechargement.
 6. Modifiez le profil et le mot de passe ; vérifiez la déconnexion puis la
    reconnexion avec le nouveau mot de passe.
-7. Testez les largeurs desktop et smartphone dans Opera. Si une ancienne version
-   demeure, faites un rechargement forcé une fois ; le shell v9 renouvelle ensuite
+7. Testez les largeurs desktop et smartphone dans Opera. Après reconstruction de
+   l’image, faites un rechargement forcé une fois ; le shell v15 renouvelle ensuite
    le cache du service worker.
 
 ---
@@ -515,8 +725,10 @@ notamment :
 - `users` : identité, rôle, statut, hachage du mot de passe, version de jeton ;
 - `machines`, `machine_technician_access`, `sensors` et `thresholds` : parc et
   autorisations ;
-- `measurements` : valeurs horodatées, mode d’acquisition et source du courant ;
-- `alerts` et `alert_events` : état et historique de prise en charge ;
+- `measurements` : valeurs horodatées, mode d’acquisition, source du courant et
+  courant RMS nullable lorsque sa source est indisponible ;
+- `alerts` : état, mode d’acquisition nullable pour préserver l’origine inconnue
+  des alertes historiques, et `alert_events` : historique de prise en charge ;
 - `interventions` : affectation, statut, diagnostic, travail, résultat et révision ;
 - `maintenance_failures` et `calibration_records` : historique de maintenance ;
 - `technician_notifications`, `user_notifications` : événements destinés aux acteurs ;
@@ -645,6 +857,11 @@ si un onglet était déjà ouvert.
     réponse générique pour une adresse inconnue.
 11. Modifiez les préférences, puis reconnectez-vous pour vérifier la durée des
     nouveaux jetons. Les jetons déjà émis ne changent pas de date d’expiration.
+12. Dans **Sauvegardes PostgreSQL**, créez une sauvegarde et vérifiez sa date,
+    taille et son statut; téléchargez-la et consultez l’historique. Testez le refus
+    d’accès pour un compte non administrateur. Pour tester l’automatisation,
+    choisissez temporairement un intervalle d’une minute, attendez la sauvegarde,
+    puis remettez l’intervalle souhaité.
 
 ### Scénarios de test — Technicien de maintenance
 
@@ -670,6 +887,38 @@ si un onglet était déjà ouvert.
 11. Répétez la connexion avec chaque compte Technicien concerné ; les comptes
     partagent le même tableau, mais chaque liste de machines reste limitée aux
     autorisations de ce compte.
+12. Dans « Mes machines », vérifiez la fiche détaillée avec une mesure simulée
+    puis une mesure matérielle; comparez les capteurs, alertes et valeurs avec
+    celles renvoyées par l’API. Essayez l’URL d’une machine non autorisée : l’API
+    doit répondre `404`.
+13. Dans une intervention attribuée, joignez une image PNG/JPEG/WebP, rechargez la
+    page puis consultez-la. Essayez un fichier texte et une intervention d’un
+    autre Technicien : les demandes doivent être refusées. Un redémarrage normal
+    `docker compose restart backend` doit conserver le fichier; ne supprimez pas
+    les volumes Docker.
+14. Pour tester Web Push, configurez d’abord des clés VAPID, servez la page en
+    HTTPS (ou `localhost`), accordez la permission navigateur, activez les
+    notifications et déclenchez une alerte/intervention de test. Vérifiez aussi
+    le refus quand les clés ne sont pas configurées. Les tests automatisés
+    simulent l’acceptation par le service Push; ils ne remplacent pas ce test réel.
+15. Pour le délai US-43, déclenchez une alerte et relevez le délai de traitement
+    backend puis le délai jusqu’à l’accusé de réception dans l’application. Les
+    anciennes alertes et l’heure de capture physique ne disposent pas de ces
+    informations; la mesure d’acquisition firmware reste à ajouter si elle est
+    nécessaire.
+
+**Contrôle ciblé des mesures en direct**
+
+- Dans « Mesures des capteurs », gardez le mode « Réel » et vérifiez que les
+  valeurs, statistiques et graphique se mettent à jour toutes les 5 secondes
+  sans rechargement complet.
+- Sélectionnez successivement Humidité, Vibrations et Courant ; attendez au
+  moins deux cycles après chaque sélection et confirmez que le graphique ne
+  revient pas à Température.
+- Comparez une valeur récente avec la publication « Publié : » de Thonny. En
+  débranchant l’ESP32, vérifiez que l’âge augmente puis que l’interface indique
+  les données obsolètes après 30 secondes. Ce test matériel n’est pas remplacé
+  par les tests automatisés avec réponses API simulées.
 
 ### Scénarios de test — Responsable de maintenance
 
@@ -692,11 +941,15 @@ si un onglet était déjà ouvert.
 
 ### Scénarios de test — Directeur de production
 
-Les vérifications disponibles et celles qui dépendront du futur espace dédié sont
-détaillées à la section 5. Le rôle peut être testé aujourd’hui pour confirmer
-l’authentification, les lectures communes, le refus des opérations d’écriture et
-l’accès à son propre profil. Les indicateurs et pages de la maquette ne sont pas
-encore livrés.
+Dans l’espace Directeur, vérifiez l’actualisation de la page active, les filtres
+par période, machine et mode, ainsi que les vues d’ensemble, disponibilité,
+pannes, rapports, notifications et profil. Dans Coût des arrêts, enregistrez un
+tarif de test sur une machine de test, vérifiez l’identité et l’historique puis
+confirmez que les devises restent séparées. Vérifiez le refus des routes de
+tarification pour un rôle non Directeur. Les essais de panne doivent utiliser une
+déclaration contrôlée du Responsable; une alerte de capteur seule ne constitue
+pas une panne confirmée. Pour valider la couverture et le statut obsolète,
+attendez au-delà du seuil configuré ou utilisez un jeu de données isolé.
 
 ### Tests automatisés et vérifications front-end
 
@@ -739,9 +992,10 @@ par une carte ESP32.
 - Les notifications externes sont par courriel SMTP. WhatsApp n’est pas intégré.
 - Les règles d’alerte actuelles sont des seuils ; elles ne constituent pas une
   prédiction statistique ou une preuve de panne matérielle.
-- Le rôle Directeur existe, mais son interface spécialisée, ses agrégations
-  industrielles, ses rapports et ses calculs de coûts restent à développer ; ne
-  présentez pas les valeurs de la maquette comme des données de production.
+- L’espace Directeur et ses rapports sont présents. Les indicateurs qui demandent
+  un historique d’arrêts confirmés ou des paramètres économiques restent
+  explicitement indisponibles; ne présentez pas les valeurs de la maquette comme
+  des données de production.
 - La calibration dans l’application est un enregistrement de maintenance ; elle ne
   reprogramme pas automatiquement un capteur.
 

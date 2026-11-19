@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI
@@ -8,8 +9,10 @@ from sqlalchemy import inspect, select, text
 from pwdlib import PasswordHash
 from app.api.admin import router as admin_router
 from app.api.director import router as director_router
+from app.api.manager import router as manager_router
 from app.api.routes import router
 from app.infrastructure.database import Base, SessionLocal, engine
+from app.infrastructure.database_backups import reconcile_interrupted_backups, run_backup_scheduler
 from app.infrastructure.models import (
     MachineRow,
     MachineTechnicianAccessRow,
@@ -46,13 +49,35 @@ def initialize_data():
             connection.execute(
                 text("ALTER TABLE measurements ADD COLUMN acquisition_mode VARCHAR(20) NOT NULL DEFAULT 'hardware'")
             )
+    if engine.dialect.name == "postgresql":
+        current_rms_column = next(
+            column for column in inspect(engine).get_columns("measurements")
+            if column["name"] == "current_rms"
+        )
+        if not current_rms_column["nullable"]:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE measurements ALTER COLUMN current_rms DROP NOT NULL")
+                )
     table_migrations = {
         "user_notifications": {
             "read_at": timestamp_type,
         },
+        "technician_notifications": {
+            "push_sent_at": timestamp_type,
+            "received_at": timestamp_type,
+        },
         "alerts": {
             "acknowledged_by_id": "INTEGER",
             "acknowledged_at": timestamp_type,
+            "acquisition_mode": "VARCHAR(20)",
+        },
+        "measurements": {
+            "received_at": timestamp_type,
+        },
+        "alert_events": {
+            "source_measurement_id": "INTEGER REFERENCES measurements(id) ON DELETE SET NULL",
+            "processing_delay_ms": "INTEGER",
         },
         "interventions": {
             "assigned_to_id": "INTEGER",
@@ -66,6 +91,9 @@ def initialize_data():
             "updated_at": timestamp_type,
             "resolved_at": timestamp_type,
             "revision": "INTEGER NOT NULL DEFAULT 1",
+        },
+        "manager_confirmed_failures": {
+            "intervention_id": "INTEGER REFERENCES interventions(id) ON DELETE SET NULL",
         },
     }
     existing_tables = set(inspect(engine).get_table_names())
@@ -86,6 +114,25 @@ def initialize_data():
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE machines ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_measurements_machine_recorded_at ON measurements (machine_id, recorded_at)"))
+            for constraint in inspect(engine).get_unique_constraints("sensors"):
+                if set(constraint.get("column_names") or ()) == {"machine_id", "metric"}:
+                    constraint_name = (constraint.get("name") or "").replace('"', '""')
+                    if constraint_name:
+                        connection.execute(
+                            text(f'ALTER TABLE sensors DROP CONSTRAINT IF EXISTS "{constraint_name}"')
+                        )
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_alert_events_source_measurement_id ON alert_events (source_measurement_id)")
+            )
+            backup_size_column = next(
+                column
+                for column in inspect(engine).get_columns("database_backups")
+                if column["name"] == "size_bytes"
+            )
+            if "BIGINT" not in str(backup_size_column["type"]).upper():
+                connection.execute(
+                    text("ALTER TABLE database_backups ALTER COLUMN size_bytes TYPE BIGINT")
+                )
     if "interventions" in existing_tables:
         with engine.begin() as connection:
             connection.execute(
@@ -157,6 +204,7 @@ def initialize_data():
                 )
             )
         db.commit()
+        reconcile_interrupted_backups(db)
     finally:
         db.close()
 
@@ -165,18 +213,31 @@ def initialize_data():
 async def lifespan(app: FastAPI):
     initialize_data()
     ingestor = None
+    backup_stop_event = threading.Event()
+    backup_scheduler = threading.Thread(
+        target=run_backup_scheduler,
+        args=(backup_stop_event,),
+        name="database-backup-scheduler",
+        daemon=True,
+    )
+    backup_scheduler.start()
     if settings.mqtt_enabled:
         ingestor = MqttIngestor()
         ingestor.start()
         app.state.mqtt_ingestor = ingestor
-    yield
-    if ingestor is not None:
-        ingestor.stop()
+    try:
+        yield
+    finally:
+        backup_stop_event.set()
+        backup_scheduler.join(timeout=5)
+        if ingestor is not None:
+            ingestor.stop()
 
 
 app = FastAPI(title="PrediMaint API", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(manager_router)
 app.include_router(director_router)
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#1D3B3A">
   <title>PrediMaint — Maintenance prédictive</title>
-  <link rel="stylesheet" href="/static/styles.css?v=9">
+  <link rel="stylesheet" href="/static/styles.css?v=27">
 </head>
 <body>
   <main class="shell">
@@ -63,6 +63,7 @@
           <button data-manager-page="alerts"><span>⚠</span>Alertes</button>
           <button data-manager-page="interventions"><span>▤</span>Interventions</button>
           <button data-manager-page="equipment"><span>⚙</span>Parc et capteurs</button>
+          <button data-manager-page="comparison"><span>⇄</span>Comparer des machines</button>
           <button data-manager-page="thresholds"><span>⌁</span>Seuils d'alerte</button>
           <button data-manager-page="performance"><span>◷</span>Performance</button>
           <button data-manager-page="profile"><span>◉</span>Mon profil</button>
@@ -75,6 +76,7 @@
           <div><h1 id="manager-page-title">Vue d'ensemble</h1><p id="manager-page-subtitle">Suivez l'état du parc et les interventions de maintenance.</p></div>
           <div class="manager-header-user"><span id="manager-header-name">Responsable maintenance</span><span id="manager-avatar" class="avatar">RM</span></div>
         </header>
+      <p id="manager-data-error" class="inline-error hidden" role="alert"></p>
       <div id="generic-welcome" class="welcome"><div><span class="muted">Espace</span><strong id="role-label"></strong></div><div class="welcome-actions"><span class="freshness">Actualisation automatique · 5 s</span></div></div>
       <div id="manager-dashboard-content">
       <section class="manager-page" data-manager-view="overview">
@@ -84,13 +86,30 @@
           <div id="machine-list"></div>
         </section>
         <section class="panel">
-          <div class="section-title"><div><p class="eyebrow">SURVEILLANCE</p><h2>Mesures récentes</h2></div><span class="muted">La source indiquée concerne le courant</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Heure</th><th>Temp. °C</th><th>Humidité %</th><th>Vibration /s</th><th>Courant A</th><th>Source du courant</th></tr></thead><tbody id="measurements"></tbody></table></div>
+          <div class="section-title"><div><p class="eyebrow">SURVEILLANCE</p><h2>Mesures récentes</h2></div>
+            <label>Mode<select id="manager-acquisition-mode"><option value="hardware" selected>Réel</option><option value="simulated">Simulé</option></select></label></div>
+          <p id="manager-measurement-freshness" class="muted" role="status"></p>
+          <div class="table-wrap"><table><thead><tr><th>Date / heure</th><th>Temp. °C</th><th>Humidité %</th><th>Vibrations (événements/s)</th><th>Événements</th><th>Courant A</th><th>Source du courant</th><th>Mode</th></tr></thead><tbody id="measurements"></tbody></table></div>
         </section>
         <section class="panel"><div class="section-title"><div><p class="eyebrow">COMPTE</p><h2>Mes notifications</h2></div></div><div id="user-notifications"></div></section>
       </section>
       <section class="manager-page hidden" data-manager-view="alerts">
-        <section class="panel"><div class="section-title"><div><p class="eyebrow">ÉVÉNEMENTS</p><h2>Alertes du parc</h2></div></div><div id="alerts"></div></section>
+        <section class="panel"><div class="section-title"><div><p class="eyebrow">ÉVÉNEMENTS</p><h2>Alertes du parc</h2></div>
+          <div class="manager-filters">
+            <label>Origine<select id="manager-alert-mode"><option value="hardware" selected>Réel</option><option value="simulated">Simulé</option><option value="all">Toutes</option><option value="unknown">Origine inconnue</option></select></label>
+            <label>Statut<select id="manager-alert-status"><option value="all" selected>Tous</option><option value="new">Nouvelle</option><option value="acknowledged">Acquittée</option><option value="closed">Clôturée</option><option value="false_positive">Fausse alerte</option></select></label>
+          </div></div><div id="alerts"></div></section>
+        <section class="panel">
+          <p class="eyebrow">DIAGNOSTIC</p><h2>Déclarer une panne confirmée</h2>
+          <p class="muted">Cette déclaration est distincte d'une alerte de capteur. Elle constitue un incident de maintenance confirmé.</p>
+          <form id="manager-failure-form" class="asset-form manager-failure-form">
+            <label>Machine<select name="machine_id" id="manager-failure-machine" required></select></label>
+            <label>Type de panne<select name="failure_type"><option value="mechanical">Mécanique</option><option value="electrical">Électrique</option><option value="thermal">Thermique</option><option value="control">Commande / contrôle</option><option value="other">Autre</option></select></label>
+            <label class="span-two">Description<textarea name="description" rows="2" minlength="3" maxlength="4000" required></textarea></label>
+            <button class="primary" type="submit">Enregistrer la panne</button><span id="manager-failure-message" class="muted" role="status"></span>
+          </form>
+          <h3>Incidents et rétablissements</h3><div id="manager-failures"></div>
+        </section>
       </section>
       <section class="manager-page hidden" data-manager-view="interventions">
         <section id="assignment-panel" class="panel hidden">
@@ -98,6 +117,7 @@
         <form id="assignment-form" class="assignment-form">
           <label>Machine<select name="machine_id" id="assignment-machine" required></select></label>
           <label>Technicien<select name="assigned_to_id" id="assignment-technician" required></select></label>
+          <label>Panne confirmée associée<select name="failure_id" id="assignment-failure"><option value="">Aucune</option></select></label>
           <label>Intitulé<input name="title" required minlength="2" maxlength="200"></label>
           <label>Priorité<select name="priority"><option value="normal">Normale</option><option value="low">Basse</option><option value="high">Haute</option><option value="urgent">Urgente</option></select></label>
           <label>Échéance<input name="due_at" type="datetime-local"></label>
@@ -112,6 +132,7 @@
         <section id="threshold-panel" class="panel hidden">
         <p class="eyebrow">CONFIGURATION</p><h2>Seuils d'alerte</h2>
         <form id="threshold-form" class="threshold-form">
+          <label>Machine<select name="machine_id" id="threshold-machine" required></select></label>
           <label>Grandeur<select name="metric"><option value="temperature">Température (°C)</option><option value="humidity">Humidité (%)</option><option value="vibration_rate">Vibrations (/s)</option><option value="current_rms">Courant (A)</option></select></label>
           <label>Avertissement<input name="warning" type="number" step="0.1" required></label>
           <label>Critique<input name="critical" type="number" step="0.1" required></label><button class="primary">Enregistrer</button>
@@ -124,7 +145,7 @@
         <p class="eyebrow">ADMINISTRATION DU PARC</p><h2>Machines et capteurs</h2>
         <div class="asset-grid">
           <form id="machine-form" class="asset-form">
-            <h3>Déclarer une machine</h3><label>Identifiant de connexion<input name="id" pattern="[a-z0-9][a-z0-9_-]*" required maxlength="80" placeholder="pompe-02"></label>
+            <h3>Déclarer une machine</h3><label>Identifiant de connexion<input name="id" pattern="[a-z0-9](?:[a-z0-9_]|-)*" required maxlength="80" placeholder="pompe-02"></label>
             <label>Nom<input name="name" required maxlength="160"></label><label>Description<textarea name="description" maxlength="2000" rows="2"></textarea></label>
             <div class="actions"><button id="machine-submit" class="primary">Ajouter la machine</button><button id="machine-cancel" type="button" class="quiet hidden">Annuler</button></div><p id="machine-message" class="muted"></p>
           </form>
@@ -142,9 +163,34 @@
       </section>
       <section class="manager-page hidden" data-manager-view="performance">
         <section class="panel">
-          <p class="eyebrow">INDICATEURS INDUSTRIELS</p><h2>Performance des équipements</h2>
-          <p class="callout" role="status">Les données disponibles ne permettent pas encore de calculer des indicateurs de disponibilité, MTBF ou MTTR fiables. Les arrêts planifiés, les périodes de panne confirmées et les reprises ne sont pas historisés.</p>
-          <p class="muted">Le seuil de couverture retenu pour une publication future est de 95 %. La couverture actuelle n'est pas calculable avec l'historique disponible. Aucune valeur illustrative n'est présentée comme une mesure réelle.</p>
+          <div class="section-title"><div><p class="eyebrow">INDICATEURS INDUSTRIELS</p><h2>Performance des équipements</h2></div>
+            <label>Période<select id="manager-performance-period"><option value="24h">24 dernières heures</option><option value="7d" selected>7 derniers jours</option><option value="30d">30 derniers jours</option></select></label></div>
+          <p id="manager-performance-updated" class="muted" role="status">Chargement des données réelles…</p>
+          <div id="manager-performance-kpis" class="cards"></div>
+          <p id="manager-performance-note" class="callout">La disponibilité mesure la supervision MQTT, pas l'état mécanique. Les valeurs sont calculées uniquement à partir des transitions persistées et la couverture est signalée.</p>
+        </section>
+        <section class="panel"><div class="section-title"><div><p class="eyebrow">TENDANCE</p><h2>Disponibilité de supervision</h2></div></div><div id="manager-performance-trend" class="manager-trend" aria-label="Évolution de la disponibilité"></div></section>
+        <section class="panel"><div class="section-title"><div><p class="eyebrow">ÉQUIPEMENTS</p><h2>Indicateurs par machine</h2></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Machine</th><th>État MQTT</th><th>Dernière télémétrie</th><th>Disponibilité supervision</th><th>MTBF</th><th>MTTR</th><th>Pannes confirmées</th></tr></thead><tbody id="manager-performance-machines"></tbody></table></div>
+        </section>
+        <section class="panel"><div class="section-title"><div><p class="eyebrow">HISTORIQUE</p><h2>Pannes confirmées sur la période</h2></div></div><div id="manager-performance-failures"></div></section>
+        <section class="panel"><div class="section-title"><div><p class="eyebrow">OBJECTIF DE SERVICE</p><h2>SLA de supervision</h2></div></div>
+          <form id="manager-sla-form" class="manager-sla-form"><label>Disponibilité cible (%)<input type="number" name="target_percentage" min="0.001" max="100" step="0.001" placeholder="Non configurée"></label>
+            <button class="quiet" type="submit">Enregistrer la cible</button><span id="manager-sla-message" class="muted" role="status"></span></form>
+          <div id="manager-sla-summary" class="manager-sla-summary"></div>
+        </section>
+      </section>
+      <section class="manager-page hidden" data-manager-view="comparison">
+        <section class="panel"><p class="eyebrow">ANALYSE DU PARC</p><h2>Comparer plusieurs machines</h2>
+          <p class="muted">Choisissez au moins deux machines et un mode de mesure. Les valeurs proviennent des dernières télémétries enregistrées.</p>
+          <form id="manager-comparison-form" class="manager-comparison-form">
+            <label>Machines<select id="manager-compare-machines" name="machine_ids" multiple size="4" required></select></label>
+            <label>Grandeur<select name="metric"><option value="temperature">Température (°C)</option><option value="humidity">Humidité (%)</option><option value="vibration_rate">Vibration (/s)</option><option value="current_rms">Courant (A)</option></select></label>
+            <label>Mode<select name="acquisition_mode"><option value="hardware">Réel</option><option value="simulated">Simulé</option></select></label>
+            <button class="primary" type="submit">Comparer</button>
+          </form>
+          <p id="manager-comparison-message" class="muted" role="status"></p>
+          <div class="table-wrap"><table><thead><tr><th>Machine</th><th>État</th><th>Dernière mesure</th><th>Valeur comparée</th><th>Seuil critique</th></tr></thead><tbody id="manager-comparison-results"></tbody></table></div>
         </section>
       </section>
       <section id="manager-profile" class="manager-page hidden" data-manager-view="profile">
@@ -248,6 +294,8 @@
           <button data-admin-page="logins"><span>◷</span>Historique des connexions</button>
           <button data-admin-page="activity"><span>▤</span>Journal d'activité</button>
           <button data-admin-page="notifications"><span>♧</span>Notifications <b id="admin-notification-count" class="nav-count hidden"></b></button>
+          <button data-admin-page="backups"><span>▣</span>Sauvegardes PostgreSQL</button>
+          <button data-admin-page="sensor-replacements"><span>⌁</span>Remplacement de capteur</button>
           <button data-admin-page="profile"><span>◉</span>Mon profil</button>
           <button data-admin-page="settings"><span>⚙</span>Paramètres</button>
         </nav>
@@ -264,10 +312,11 @@
     </section>
     <p id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/static/profile.js?v=9"></script>
-  <script src="/static/director.js?v=9"></script>
-  <script src="/static/app.js?v=9"></script>
-  <script src="/static/admin.js?v=9"></script>
-  <script src="/static/technician.js?v=9"></script>
+  <script src="/static/measurement-ui.js?v=27"></script>
+  <script src="/static/profile.js?v=27"></script>
+  <script src="/static/director.js?v=27"></script>
+  <script src="/static/app.js?v=27"></script>
+  <script src="/static/admin.js?v=27"></script>
+  <script src="/static/technician.js?v=27"></script>
 </body>
 </html>

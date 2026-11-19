@@ -21,7 +21,7 @@ class Telemetry:
     humidity: float
     vibration_rate: float
     vibration_edges: int
-    current_rms: float
+    current_rms: float | None
     current_source: str = "simulated"
 
 
@@ -42,6 +42,9 @@ def evaluate_thresholds(measurement: Telemetry, thresholds: list[Threshold]) -> 
     decisions = []
     for threshold in thresholds:
         value = getattr(measurement, threshold.metric)
+        if value is None:
+            decisions.append((threshold.metric, AlertDecision(None, None)))
+            continue
         severity = Severity.CRITICAL if value >= threshold.critical else Severity.WARNING if value >= threshold.warning else None
         decisions.append((threshold.metric, AlertDecision(severity, value if severity else None)))
     return decisions

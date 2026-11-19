@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_use_tls: bool = True
     public_base_url: str = "http://localhost:8001"
+    backup_directory: str = "/var/lib/predimaint/backups"
+    intervention_photo_directory: str = "/var/lib/predimaint/intervention-photos"
+    web_push_vapid_public_key: str = ""
+    web_push_vapid_private_key: str = ""
+    web_push_vapid_subject: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
 

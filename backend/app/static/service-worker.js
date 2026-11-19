@@ -1,12 +1,13 @@
-const CACHE_NAME = "predimaint-shell-v9";
+const CACHE_NAME = "predimaint-shell-v27";
 const APP_SHELL = [
   "/",
-  "/static/styles.css?v=9",
-  "/static/profile.js?v=9",
-  "/static/director.js?v=9",
-  "/static/app.js?v=9",
-  "/static/admin.js?v=9",
-  "/static/technician.js?v=9",
+  "/static/styles.css?v=27",
+  "/static/measurement-ui.js?v=27",
+  "/static/profile.js?v=27",
+  "/static/director.js?v=27",
+  "/static/app.js?v=27",
+  "/static/admin.js?v=27",
+  "/static/technician.js?v=27",
 ];
 
 self.addEventListener("install", (event) => {
@@ -21,6 +22,32 @@ self.addEventListener("activate", (event) => {
     )),
   );
   self.clients.claim();
+});
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = { body: event.data ? event.data.text() : "" };
+  }
+  event.waitUntil(self.registration.showNotification(payload.title || "PrediMaint", {
+    body: payload.body || "Une nouvelle notification vous est adressée.",
+    data: { url: payload.url || "/#tech-notifications" },
+    tag: payload.tag || "predimaint-notification",
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const destination = new URL(event.notification.data?.url || "/#tech-notifications", self.location.origin);
+  event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+    const existing = clients.find((client) => new URL(client.url).origin === destination.origin);
+    if (existing) {
+      return existing.navigate(destination.href).then((client) => client.focus());
+    }
+    return self.clients.openWindow(destination.href);
+  }));
 });
 
 self.addEventListener("fetch", (event) => {

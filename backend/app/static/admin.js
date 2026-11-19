@@ -1,5 +1,6 @@
 (() => {
   const $ = (selector, root = document) => root.querySelector(selector);
+  const measurementUi = window.PrediMaintMeasurements;
   const pageTitles = {
     overview: ["Vue d'ensemble", "Bienvenue, administrateur système !"],
     users: ["Gestion des utilisateurs", "Consultez et gérez les comptes de la plateforme."],
@@ -8,6 +9,8 @@
     logins: ["Historique des connexions", "Connexions réussies et tentatives échouées."],
     activity: ["Journal d'activité", "Traçabilité des opérations administratives."],
     notifications: ["Notifications", "Messages adressés aux utilisateurs et état de livraison."],
+    backups: ["Sauvegarde de la base de données", "Administration / Gestion des sauvegardes PostgreSQL."],
+    "sensor-replacements": ["Remplacement d'un capteur", "Conservez l'ancien capteur, ses mesures et la traçabilité du remplacement."],
     profile: ["Mon profil", "Gérez vos informations et la sécurité de votre compte."],
     settings: ["Paramètres", "Préférences de l'espace administrateur."],
   };
@@ -20,13 +23,12 @@
   let currentPage = "overview";
   let notificationCount = 0;
   let searchTimer;
+  let backupRefreshTimer;
 
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[char]));
-  const formatDate = (value) => value
-    ? new Date(value).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })
-    : "—";
+  const formatDate = (value) => measurementUi.formatDate(value);
   const formatRole = (role) => roleNames[role] || role;
 
   async function api(path, options = {}) {
@@ -112,19 +114,25 @@
     const maxCount = Math.max(1, ...data.user_trend.map((item) => item.count));
     const chart = data.user_trend.map((item) => {
       const height = item.count ? Math.max(12, Math.round(item.count / maxCount * 125)) : 4;
-      return `<div class="chart-day"><span class="chart-bar-label">${item.count}</span><div class="chart-bar" style="height:${height}px" title="${item.count} compte(s) créé(s)"></div><span>${new Date(`${item.date}T12:00:00`).toLocaleDateString("fr-FR", { weekday: "short" })}</span></div>`;
+      return `<div class="chart-day"><span class="chart-bar-label">${item.count}</span><div class="chart-bar" style="height:${height}px" title="${item.count} compte(s) créé(s)"></div><span>${measurementUi.formatDay(item.date)}</span></div>`;
     }).join("");
     const totalByRole = roleEntries.reduce((sum, item) => sum + item[1], 0);
-    const acquisitionLabel = data.acquisition_mode === "simulated"
-      ? "Mesures générées par le simulateur logiciel"
-      : data.acquisition_mode === "hardware"
-        ? "Mesures reçues du firmware ESP32"
-        : "En attente de la première mesure";
-    const currentLabel = data.measurement_source === "simulated"
-      ? "courant simulé"
-      : data.measurement_source === "hardware"
-        ? "courant lu par ACS712"
-        : "courant non disponible";
+    const acquisitionLabel = data.acquisition_mode === "waiting"
+      ? "En attente de la première mesure"
+      : `Mode ${measurementUi.modeLabel(data.acquisition_mode)}`;
+    const latestMeasurement = data.measurement_recorded_at ? {
+      recorded_at: data.measurement_recorded_at,
+      age_seconds: data.measurement_age_seconds,
+      acquisition_mode: data.acquisition_mode,
+      current_rms: data.measurement_current_rms,
+      current_source: data.measurement_source,
+    } : null;
+    measurementUi.markReceived(latestMeasurement);
+    const currentLabel = measurementUi.currentValue(latestMeasurement);
+    const currentSource = measurementUi.currentSourceLabel(latestMeasurement);
+    const latestDescription = latestMeasurement
+      ? `${formatDate(latestMeasurement.recorded_at)} · ${measurementUi.freshness(latestMeasurement).label}`
+      : "Aucune mesure récente";
     $("#admin-page").innerHTML = `
       <div class="admin-stats">
         ${metric("Utilisateurs totaux", data.total_users, "comptes enregistrés")}
@@ -153,7 +161,7 @@
           <div class="admin-card-body">${data.recent_notifications.map((row) => notificationItem(row)).join("") || '<div class="empty-state">Aucune notification.</div>'}</div>
         </section>
       </div>
-      <p class="callout"><strong>Mode d'acquisition :</strong> ${acquisitionLabel} ; ${currentLabel}. En simulation, le programme Python peut générer des valeurs normales, d'avertissement et critiques sans ESP32.</p>`;
+      <p class="callout"><strong>Dernière mesure :</strong> ${acquisitionLabel} · ${latestDescription}. Courant : ${currentLabel} · ${currentSource}. En simulation, le programme Python peut générer des valeurs normales, d'avertissement et critiques sans ESP32.</p>`;
   }
 
   function userRow(user) {
@@ -340,6 +348,248 @@
     </section><p class="callout">Un message est toujours visible dans l'espace du compte ciblé. L'envoi par e-mail nécessite une configuration SMTP ; les échecs sont affichés ici et conservés dans le journal.</p>`;
   }
 
+  function formatBytes(value) {
+    if (!Number.isFinite(value) || value < 0) return "—";
+    if (value < 1024) return `${value} octets`;
+    const units = ["Ko", "Mo", "Go", "To"];
+    let size = value / 1024;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size.toLocaleString("fr-FR", { maximumFractionDigits: 1 })} ${units[unit]}`;
+  }
+
+  function backupStatus(status) {
+    return {
+      succeeded: '<span class="status">Réussie</span>',
+      running: '<span class="status backup-running">En cours</span>',
+      failed: '<span class="status offline">Échec</span>',
+    }[status] || '<span class="status offline">Inconnue</span>';
+  }
+
+  async function renderBackups() {
+    window.clearInterval(backupRefreshTimer);
+    const data = await api("/admin/backups");
+    if (currentPage !== "backups" || $("#admin-app").classList.contains("hidden")) return;
+    const lastAttempt = data.last_attempt;
+    const lastSuccess = data.last_backup;
+    const statusName = lastAttempt
+      ? { succeeded: "Réussie", failed: "Échec", running: "En cours" }[lastAttempt.status] || "Inconnue"
+      : "Aucune sauvegarde";
+    const rows = data.items.map((row) => `<tr>
+      <td><strong>${escapeHtml(row.filename)}</strong><small>${formatDate(row.created_at)} · ${formatBytes(row.size_bytes)}</small></td>
+      <td>${backupStatus(row.status)}${row.error_message ? `<small class="backup-error">${escapeHtml(row.error_message)}</small>` : ""}</td>
+      <td>${row.trigger === "automatic" ? "Automatique" : "Manuelle"}</td>
+      <td>${row.status === "succeeded" ? `<button class="quiet" type="button" data-backup-download="${row.id}">Télécharger</button>` : "—"}</td>
+    </tr>`).join("");
+    const nextRun = data.enabled && data.next_run_at
+      ? formatDate(data.next_run_at)
+      : "Désactivée";
+    $("#admin-page").innerHTML = `
+      <div class="admin-stats backup-stats">
+        ${metric("Dernière sauvegarde réussie", lastSuccess ? formatDate(lastSuccess.created_at) : "—", lastSuccess ? lastSuccess.filename : "Aucune sauvegarde réussie")}
+        ${metric("Statut de la dernière tentative", statusName, lastAttempt ? formatDate(lastAttempt.created_at) : "Aucune tentative enregistrée")}
+        ${metric("Taille du dernier fichier", lastSuccess ? formatBytes(lastSuccess.size_bytes) : "—", "Archive PostgreSQL vérifiée")}
+        ${metric("Sauvegarde automatique", data.enabled ? `Toutes les ${data.interval_minutes} min` : "Désactivée", `Prochaine exécution : ${nextRun}`)}
+      </div>
+      <section class="admin-card">
+        <div class="admin-card-header"><h2>Actions</h2></div>
+        <div class="admin-card-body">
+          <button id="backup-create" class="primary backup-create" type="button">▣ &nbsp; Créer une sauvegarde</button>
+          <p id="backup-action-message" class="muted" role="status"></p>
+          <form id="backup-schedule-form" class="backup-schedule">
+            <label class="backup-enabled"><input name="enabled" type="checkbox" ${data.enabled ? "checked" : ""}> Activer la sauvegarde automatique</label>
+            <label>Fréquence (minutes)<input name="interval_minutes" type="number" min="1" max="525600" required value="${data.interval_minutes}"></label>
+            <div class="form-actions"><button class="quiet" type="submit">Enregistrer la fréquence</button><span id="backup-schedule-message" class="muted" role="status"></span></div>
+          </form>
+          <p class="callout">Les fichiers sont stockés dans un volume Docker dédié, séparé du volume PostgreSQL. Une sauvegarde quotidienne correspond à 1&nbsp;440 minutes.</p>
+        </div>
+      </section>
+      <section class="admin-card">
+        <div class="admin-card-header"><h2>Historique des sauvegardes</h2><span>${data.items.length} sauvegarde(s), 100 dernières affichées</span></div>
+        <div class="admin-card-body"><div class="admin-table-wrap"><table class="admin-table backup-table">
+          <thead><tr><th>Nom du fichier</th><th>Statut</th><th>Déclenchement</th><th>Fichier</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="4" class="empty-state">Aucune sauvegarde enregistrée.</td></tr>'}</tbody>
+        </table></div></div>
+      </section>`;
+    $("#backup-create").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const message = $("#backup-action-message");
+      button.disabled = true;
+      message.textContent = "Création et vérification de la sauvegarde en cours…";
+      try {
+        await api("/admin/backups", { method: "POST" });
+        showToast("Sauvegarde PostgreSQL créée et vérifiée.");
+        await renderBackups();
+      } catch (error) {
+        message.textContent = error.message;
+        message.classList.add("error");
+        await renderBackups();
+      } finally {
+        const currentButton = $("#backup-create");
+        if (currentButton) currentButton.disabled = false;
+      }
+    });
+    $("#backup-schedule-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const values = new FormData(form);
+      const message = $("#backup-schedule-message");
+      try {
+        await api("/admin/backups/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled: values.get("enabled") === "on",
+            interval_minutes: Number(values.get("interval_minutes")),
+          }),
+        });
+        showToast("Planification des sauvegardes enregistrée.");
+        await renderBackups();
+      } catch (error) {
+        message.textContent = error.message;
+        message.classList.add("error");
+      }
+    });
+    backupRefreshTimer = window.setInterval(() => {
+      if (currentPage === "backups") renderBackups().catch(pageError);
+    }, 30000);
+  }
+
+  async function renderSensorReplacements() {
+    const [sensors, replacements] = await Promise.all([
+      api("/admin/sensors"),
+      api("/admin/sensor-replacements"),
+    ]);
+    const metricNames = {
+      temperature: "Température",
+      humidity: "Humidité",
+      vibration_rate: "Vibration",
+      current_rms: "Courant",
+    };
+    const machineMap = new Map(
+      sensors.map((sensor) => [sensor.machine_id, {
+        id: sensor.machine_id,
+        name: sensor.machine_name,
+        active: sensor.machine_active,
+      }]),
+    );
+    const machines = [...machineMap.values()].filter((machine) => machine.active);
+    const machineOptions = machines.map((machine) =>
+      `<option value="${escapeHtml(machine.id)}">${escapeHtml(machine.name)}</option>`
+    ).join("");
+    const activeSensors = sensors.filter((sensor) => sensor.enabled && sensor.machine_active);
+    const historyRows = replacements.map((item) => `<tr>
+      <td>${formatDate(item.replaced_at)}</td>
+      <td><strong>${escapeHtml(item.machine_name)}</strong><small>${escapeHtml(metricNames[item.metric] || item.metric)}</small></td>
+      <td>#${item.old_sensor_id} · ${escapeHtml(item.old_sensor_type)}</td>
+      <td>#${item.new_sensor_id} · ${escapeHtml(item.new_sensor_type)}</td>
+      <td>${escapeHtml(item.administrator_name || item.administrator_email)}</td>
+      <td>${escapeHtml(item.reason)}</td>
+    </tr>`).join("");
+    $("#admin-page").innerHTML = `
+      <section class="admin-card form-card">
+        <div class="admin-card-header"><h2>Remplacer un capteur défectueux</h2></div>
+        <div class="admin-card-body">
+          <p class="callout">L'ancien capteur sera conservé et désactivé. Un nouvel identifiant sera créé; les mesures enregistrées après le remplacement garderont le lien avec leur capteur source.</p>
+          <form id="sensor-replacement-form">
+            <div class="form-grid">
+              <label>Machine<select name="machine_id" required ${machines.length ? "" : "disabled"}>${machineOptions}</select></label>
+              <label>Ancien capteur<select name="sensor_id" required ${activeSensors.length ? "" : "disabled"}></select></label>
+              <label>Type du nouveau capteur<input name="sensor_type" required minlength="2" maxlength="80" placeholder="DHT22"></label>
+              <label>GPIO<input name="gpio" type="number" min="0" max="39"></label>
+              <label>Unité<input name="unit" required maxlength="20" placeholder="°C"></label>
+              <label class="span-two">Motif du remplacement<textarea name="reason" required minlength="3" maxlength="2000" rows="3" placeholder="Ex. mesure instable, capteur endommagé..."></textarea></label>
+            </div>
+            <div class="form-actions"><button class="primary" type="submit" ${activeSensors.length ? "" : "disabled"}>Enregistrer le remplacement</button><span id="sensor-replacement-message" class="muted" role="status"></span></div>
+          </form>
+          ${activeSensors.length ? "" : '<p class="empty-state">Aucun capteur actif disponible pour un remplacement.</p>'}
+        </div>
+      </section>
+      <section class="admin-card">
+        <div class="admin-card-header"><h2>Historique des remplacements</h2><span>${replacements.length} remplacement(s), 100 derniers affichés</span></div>
+        <div class="admin-card-body"><div class="admin-table-wrap"><table class="admin-table">
+          <thead><tr><th>Date</th><th>Machine / grandeur</th><th>Ancien capteur</th><th>Nouveau capteur</th><th>Administrateur</th><th>Motif</th></tr></thead>
+          <tbody>${historyRows || '<tr><td colspan="6" class="empty-state">Aucun remplacement enregistré.</td></tr>'}</tbody>
+        </table></div></div>
+      </section>`;
+
+    const form = $("#sensor-replacement-form");
+    const machineSelect = form.elements.machine_id;
+    const sensorSelect = form.elements.sensor_id;
+    const updateSensorOptions = () => {
+      const options = activeSensors.filter((sensor) => sensor.machine_id === machineSelect.value);
+      sensorSelect.innerHTML = options.map((sensor) =>
+        `<option value="${sensor.id}">${escapeHtml(metricNames[sensor.metric] || sensor.metric)} · ${escapeHtml(sensor.sensor_type)} · ${escapeHtml(sensor.unit)}</option>`
+      ).join("");
+      sensorSelect.disabled = options.length === 0;
+      form.querySelector('button[type="submit"]').disabled = options.length === 0;
+    };
+    machineSelect.addEventListener("change", updateSensorOptions);
+    updateSensorOptions();
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const values = new FormData(form);
+      const machineId = String(values.get("machine_id"));
+      const sensorId = Number(values.get("sensor_id"));
+      const oldSensor = activeSensors.find((sensor) => sensor.id === sensorId);
+      if (!oldSensor || !window.confirm(
+        `Remplacer ${oldSensor.sensor_type} sur ${oldSensor.machine_name} ? L'ancien capteur et son historique seront conservés.`,
+      )) return;
+      const message = $("#sensor-replacement-message");
+      const submit = form.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        const gpioValue = String(values.get("gpio") || "").trim();
+        await api(`/admin/machines/${encodeURIComponent(machineId)}/sensors/${sensorId}/replace`, {
+          method: "POST",
+          body: JSON.stringify({
+            sensor_type: values.get("sensor_type"),
+            gpio: gpioValue ? Number(gpioValue) : null,
+            unit: values.get("unit"),
+            reason: values.get("reason"),
+          }),
+        });
+        showToast("Remplacement du capteur enregistré.");
+        await renderSensorReplacements();
+      } catch (error) {
+        message.textContent = error.message;
+        message.classList.add("error");
+        submit.disabled = false;
+      }
+    });
+  }
+
+  async function downloadBackup(id) {
+    const token = localStorage.getItem("pm_token");
+    const response = await fetch(`/api/admin/backups/${encodeURIComponent(id)}/download`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (response.status === 401) {
+      $("#logout").click();
+      throw new Error("Session expirée. Reconnectez-vous.");
+    }
+    if (!response.ok) {
+      let detail = "Téléchargement de la sauvegarde impossible.";
+      try {
+        detail = (await response.json()).detail || detail;
+      } catch (error) {
+        console.error("Réponse d'erreur API invalide", error);
+      }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `predimaint-backup-${id}.dump`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   async function renderProfile() {
     const user = await api("/admin/profile");
     $("#admin-page").innerHTML = `<section class="admin-card form-card">
@@ -414,9 +664,10 @@
           <label>Notifications par e-mail<select name="email_notifications"><option value="true" ${settings.email_notifications ? "selected" : ""}>Activées</option><option value="false" ${!settings.email_notifications ? "selected" : ""}>Désactivées</option></select></label>
           <label>Langue de l'interface<select name="language"><option value="fr" ${settings.language === "fr" ? "selected" : ""}>Français</option><option value="en" ${settings.language === "en" ? "selected" : ""}>English</option></select></label>
           <label>Durée de session<select name="session_minutes">${[15, 30, 60, 120].map((n) => `<option value="${n}" ${settings.session_minutes === n ? "selected" : ""}>${n} minutes</option>`).join("")}</select></label>
+          <label>Délai avant télémétrie obsolète (secondes)<input name="telemetry_stale_after_seconds" type="number" min="5" max="3600" step="1" required value="${settings.telemetry_stale_after_seconds}"></label>
           <div class="form-actions"><button class="primary" type="submit">Enregistrer les paramètres</button><span id="settings-message" class="muted" role="status"></span></div>
         </form>
-        <p class="callout">La durée sélectionnée s'applique aux nouveaux jetons après connexion. Les sessions déjà ouvertes conservent leur date d'expiration actuelle.</p>
+        <p class="callout">La durée sélectionnée s'applique aux nouveaux jetons après connexion. Les sessions déjà ouvertes conservent leur date d'expiration actuelle. Le délai de télémétrie sert à calculer la fraîcheur des données du Directeur.</p>
       </div></section>`;
     $("#settings-form").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -429,6 +680,7 @@
             email_notifications: form.get("email_notifications") === "true",
             language: form.get("language"),
             session_minutes: Number(form.get("session_minutes")),
+            telemetry_stale_after_seconds: Number(form.get("telemetry_stale_after_seconds")),
           }),
         });
         message.textContent = "Paramètres enregistrés.";
@@ -458,6 +710,8 @@
         case "logins": await renderLogins(); break;
         case "activity": await renderActivity(); break;
         case "notifications": await renderNotifications(); break;
+        case "backups": await renderBackups(); break;
+        case "sensor-replacements": await renderSensorReplacements(); break;
         case "profile": await renderProfile(); break;
         case "settings": await renderSettings(); break;
         default: await renderOverview();
@@ -480,6 +734,15 @@
     button.addEventListener("click", () => navigate(button.dataset.adminPage));
   });
   $("#admin-page").addEventListener("click", async (event) => {
+    const downloadButton = event.target.closest("[data-backup-download]");
+    if (downloadButton) {
+      try {
+        await downloadBackup(downloadButton.dataset.backupDownload);
+      } catch (error) {
+        showToast(error.message);
+      }
+      return;
+    }
     const navigateButton = event.target.closest("[data-go]");
     if (navigateButton) {
       navigate(navigateButton.dataset.go);
@@ -535,9 +798,13 @@
   $("#admin-logout").addEventListener("click", () => $("#logout").click());
   $("#admin-menu-toggle").addEventListener("click", () => $(".admin-sidebar").classList.toggle("open"));
   window.addEventListener("hashchange", () => {
-    if ($("#admin-app").classList.contains("hidden")) return;
+    if ($("#admin-app").classList.contains("hidden")) {
+      window.clearInterval(backupRefreshTimer);
+      return;
+    }
     const page = location.hash.slice(1);
     currentPage = pageTitles[page] ? page : "overview";
+    if (currentPage !== "backups") window.clearInterval(backupRefreshTimer);
     render();
   });
   window.addEventListener("predimaint:admin-authenticated", async () => {

@@ -1,12 +1,18 @@
 import hashlib
 import logging
 import secrets
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, desc, func, or_, select, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.auth import authenticate, current_user, get_db, hash_password, issue_token, password_hash, require_roles
@@ -17,13 +23,17 @@ from app.infrastructure.models import (
     AppliedOfflineActionRow,
     CalibrationRecordRow,
     InterventionRow,
+    InterventionPhotoRow,
     LoginEventRow,
     MachineRow,
     MachineTechnicianAccessRow,
+    ManagerFailureRow,
     MaintenanceFailureRow,
     MeasurementRow,
+    MeasurementSensorSourceRow,
     PasswordResetAttemptRow,
     PasswordResetTokenRow,
+    PushSubscriptionRow,
     SensorRow,
     ThresholdRow,
     TechnicianNotificationRow,
@@ -32,6 +42,7 @@ from app.infrastructure.models import (
 )
 from app.infrastructure.notifications import send_email
 from app.infrastructure.repository import SqlMeasurementRepository
+from app.infrastructure.web_push import dispatch_web_push, web_push_is_configured
 from app.settings import settings
 
 router = APIRouter(prefix="/api")
@@ -42,6 +53,13 @@ METRICS = {"temperature", "humidity", "vibration_rate", "current_rms"}
 INTERVENTION_STATUSES = {"assigned", "accepted", "in_progress", "completed", "cancelled"}
 RESET_WINDOW = timedelta(minutes=15)
 RESET_REQUEST_LIMIT = 3
+MAX_INTERVENTION_PHOTO_BYTES = 8 * 1024 * 1024
+WEB_PUSH_HOST_SUFFIXES = (
+    "fcm.googleapis.com",
+    "push.services.mozilla.com",
+    "notify.windows.com",
+    "push.apple.com",
+)
 
 
 class LoginInput(BaseModel):
@@ -70,6 +88,7 @@ class InterventionAssignmentInput(BaseModel):
     priority: Literal["low", "normal", "high", "urgent"] = "normal"
     due_at: datetime | None = None
     alert_id: int | None = None
+    failure_id: int | None = Field(default=None, gt=0)
 
 
 class InterventionUpdate(BaseModel):
@@ -108,6 +127,43 @@ class ProfileInput(BaseModel):
     full_name: str = Field(min_length=2, max_length=160)
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=255)
     phone: str = Field(default="", max_length=40)
+
+
+class PushSubscriptionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint: str = Field(min_length=1, max_length=2048)
+    p256dh: str = Field(min_length=16, max_length=255)
+    auth: str = Field(min_length=8, max_length=255)
+
+    @field_validator("endpoint")
+    @classmethod
+    def require_https_endpoint(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        is_allowed_host = any(
+            host == suffix or host.endswith(f".{suffix}")
+            for suffix in WEB_PUSH_HOST_SUFFIXES
+        )
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+            or not is_allowed_host
+        ):
+            raise ValueError("Le point de terminaison Push doit utiliser HTTPS et un service navigateur pris en charge")
+        return value
+
+
+class PushSubscriptionDeleteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint: str = Field(min_length=1, max_length=2048)
+
+
+class NotificationReceiptInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    notification_ids: list[int] = Field(min_length=1, max_length=100)
 
 
 class ProfilePasswordInput(BaseModel):
@@ -202,7 +258,7 @@ def add_technician_notification(
     message: str,
     target_type: str = "",
     target_id: str = "",
-) -> None:
+) -> TechnicianNotificationRow | None:
     existing = db.scalar(
         select(TechnicianNotificationRow).where(
             TechnicianNotificationRow.user_id == user_id,
@@ -210,16 +266,17 @@ def add_technician_notification(
         )
     )
     if existing is None:
-        db.add(
-            TechnicianNotificationRow(
-                user_id=user_id,
-                notification_key=key,
-                notification_type=notification_type,
-                message=message,
-                target_type=target_type,
-                target_id=target_id,
-            )
+        notification = TechnicianNotificationRow(
+            user_id=user_id,
+            notification_key=key,
+            notification_type=notification_type,
+            message=message,
+            target_type=target_type,
+            target_id=target_id,
         )
+        db.add(notification)
+        return notification
+    return None
 
 
 def intervention_dict(row: InterventionRow, db: Session) -> dict:
@@ -301,7 +358,16 @@ def me(user: UserRow = Depends(current_user)):
     }
 
 
-def machine_dict(machine: MachineRow) -> dict:
+def machine_dict(
+    machine: MachineRow,
+    latest_measurement: MeasurementRow | None = None,
+    server_time: datetime | None = None,
+) -> dict:
+    if server_time is None:
+        server_time = datetime.now(timezone.utc)
+    recorded_at = latest_measurement.recorded_at if latest_measurement else None
+    if recorded_at is not None and recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
     return {
         "id": machine.id,
         "name": machine.name,
@@ -309,7 +375,108 @@ def machine_dict(machine: MachineRow) -> dict:
         "status": machine.status,
         "active": machine.active,
         "last_seen": machine.last_seen,
+        "last_measurement_mode": (
+            latest_measurement.acquisition_mode if latest_measurement else None
+        ),
+        "measurement_recorded_at": recorded_at,
+        "measurement_server_time": server_time,
+        "measurement_age_seconds": (
+            max(0, (server_time - recorded_at).total_seconds()) if recorded_at else None
+        ),
         "created_at": machine.created_at,
+    }
+
+
+def alert_creation_events(db: Session, alert_ids: list[int]) -> dict[int, AlertEventRow]:
+    if not alert_ids:
+        return {}
+    events = db.scalars(
+        select(AlertEventRow)
+        .where(AlertEventRow.alert_id.in_(alert_ids), AlertEventRow.action == "created")
+        .order_by(AlertEventRow.created_at, AlertEventRow.id)
+    ).all()
+    result: dict[int, AlertEventRow] = {}
+    for event in events:
+        result.setdefault(event.alert_id, event)
+    return result
+
+
+def alert_dict(row: AlertRow, machine: MachineRow, creation_event: AlertEventRow | None = None) -> dict:
+    return {
+        "id": row.id,
+        "machine_id": row.machine_id,
+        "machine_name": machine.name,
+        "metric": row.metric,
+        "severity": row.severity,
+        "value": row.value,
+        "acquisition_mode": row.acquisition_mode,
+        "status": row.status,
+        "created_at": row.created_at,
+        "acknowledged_by_id": row.acknowledged_by_id,
+        "acknowledged_at": row.acknowledged_at,
+        "detected_at": creation_event.created_at if creation_event else None,
+        "source_measurement_id": creation_event.source_measurement_id if creation_event else None,
+        "processing_delay_ms": creation_event.processing_delay_ms if creation_event else None,
+    }
+
+
+@router.get("/machines/{machine_id}/details")
+def machine_details(
+    machine_id: str,
+    user: UserRow = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    machine = require_machine_access(db, user, machine_id)
+    latest = db.scalar(
+        select(MeasurementRow)
+        .where(MeasurementRow.machine_id == machine_id)
+        .order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id))
+        .limit(1)
+    )
+    sensors = db.scalars(
+        select(SensorRow).where(SensorRow.machine_id == machine_id).order_by(SensorRow.id)
+    ).all()
+    sensor_ids: dict[str, int] = {}
+    if latest is not None:
+        sources = db.scalars(
+            select(MeasurementSensorSourceRow).where(
+                MeasurementSensorSourceRow.measurement_id == latest.id
+            )
+        ).all()
+        sensor_ids = {source.metric: source.sensor_id for source in sources}
+    alerts = db.scalars(
+        select(AlertRow)
+        .where(
+            AlertRow.machine_id == machine_id,
+            AlertRow.status.not_in(("closed", "false_positive")),
+        )
+        .order_by(desc(AlertRow.created_at), desc(AlertRow.id))
+        .limit(50)
+    ).all()
+    events = alert_creation_events(db, [row.id for row in alerts])
+    active_intervention_count = db.scalar(
+        select(func.count())
+        .select_from(InterventionRow)
+        .where(
+            InterventionRow.machine_id == machine_id,
+            InterventionRow.status.in_(("assigned", "accepted", "in_progress")),
+            or_(
+                InterventionRow.assigned_to_id == user.id,
+                (InterventionRow.assigned_to_id.is_(None)) & (InterventionRow.user_id == user.id),
+            ),
+        )
+    ) or 0
+    server_time = datetime.now(timezone.utc)
+    return {
+        "machine": machine_dict(machine, latest, server_time),
+        "sensors": [sensor_dict(sensor) for sensor in sensors],
+        "latest_measurement": (
+            measurement_dict(latest, server_time, sensor_ids) if latest is not None else None
+        ),
+        "active_alerts": [
+            alert_dict(row, machine, events.get(row.id)) for row in alerts
+        ],
+        "active_intervention_count": active_intervention_count,
     }
 
 
@@ -329,7 +496,36 @@ def machines(user: UserRow = Depends(current_user), db: Session = Depends(get_db
         )
     elif user.role != "manager":
         stmt = stmt.where(MachineRow.active.is_(True))
-    return [machine_dict(row) for row in db.scalars(stmt).all()]
+    machine_rows = db.scalars(stmt).all()
+    machine_ids = [row.id for row in machine_rows]
+    latest_by_machine = {}
+    if machine_ids:
+        ranked_measurements = (
+            select(
+                MeasurementRow.id.label("measurement_id"),
+                func.row_number().over(
+                    partition_by=MeasurementRow.machine_id,
+                    order_by=(
+                        desc(MeasurementRow.recorded_at),
+                        desc(MeasurementRow.id),
+                    ),
+                ).label("measurement_rank"),
+            )
+            .where(MeasurementRow.machine_id.in_(machine_ids))
+            .subquery()
+        )
+        measurements = db.scalars(
+            select(MeasurementRow)
+            .join(ranked_measurements, ranked_measurements.c.measurement_id == MeasurementRow.id)
+            .where(ranked_measurements.c.measurement_rank == 1)
+        ).all()
+        for measurement in measurements:
+            latest_by_machine[measurement.machine_id] = measurement
+    server_time = datetime.now(timezone.utc)
+    return [
+        machine_dict(row, latest_by_machine.get(row.id), server_time)
+        for row in machine_rows
+    ]
 
 
 @router.post("/machines", status_code=status.HTTP_201_CREATED)
@@ -416,13 +612,23 @@ def create_sensor(
     if db.get(MachineRow, machine_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Machine introuvable")
     existing = db.scalar(
-        select(SensorRow).where(SensorRow.machine_id == machine_id, SensorRow.metric == data.metric)
+        select(SensorRow.id).where(
+            SensorRow.machine_id == machine_id,
+            SensorRow.metric == data.metric,
+        )
     )
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, "Un capteur est déjà déclaré pour cette grandeur")
     row = SensorRow(machine_id=machine_id, **data.model_dump(), enabled=True)
     db.add(row)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Un capteur est déjà déclaré pour cette grandeur",
+        ) from exc
     db.refresh(row)
     return sensor_dict(row)
 
@@ -437,9 +643,29 @@ def update_sensor(
     row = db.get(SensorRow, sensor_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Capteur introuvable")
-    for key, value in data.model_dump(exclude_unset=True).items():
+    values = data.model_dump(exclude_unset=True)
+    if values.get("enabled") is True and db.scalar(
+        select(SensorRow.id).where(
+            SensorRow.machine_id == row.machine_id,
+            SensorRow.metric == row.metric,
+            SensorRow.enabled.is_(True),
+            SensorRow.id != row.id,
+        )
+    ) is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Un capteur actif existe déjà pour cette grandeur",
+        )
+    for key, value in values.items():
         setattr(row, key, value)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Un capteur actif existe déjà pour cette grandeur",
+        ) from exc
     db.refresh(row)
     return sensor_dict(row)
 
@@ -464,6 +690,7 @@ def telemetry(
     limit: int = Query(100, ge=1, le=1000),
     start: datetime | None = Query(None),
     end: datetime | None = Query(None),
+    acquisition_mode: Literal["hardware", "simulated"] | None = Query(None),
     user: UserRow = Depends(current_user),
     db: Session = Depends(get_db),
 ):
@@ -475,11 +702,37 @@ def telemetry(
         stmt = stmt.where(MeasurementRow.recorded_at >= start)
     if end:
         stmt = stmt.where(MeasurementRow.recorded_at <= end)
-    rows = db.scalars(stmt.order_by(desc(MeasurementRow.recorded_at)).limit(limit)).all()
-    return [measurement_dict(row) for row in reversed(rows)]
+    if acquisition_mode is not None:
+        stmt = stmt.where(MeasurementRow.acquisition_mode == acquisition_mode)
+    rows = db.scalars(
+        stmt.order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id)).limit(limit)
+    ).all()
+    server_time = datetime.now(timezone.utc)
+    ordered_rows = list(reversed(rows))
+    sources_by_measurement: dict[int, dict[str, int]] = {}
+    if ordered_rows:
+        source_rows = db.scalars(
+            select(MeasurementSensorSourceRow).where(
+                MeasurementSensorSourceRow.measurement_id.in_([row.id for row in ordered_rows])
+            )
+        ).all()
+        for source in source_rows:
+            sources_by_measurement.setdefault(source.measurement_id, {})[source.metric] = source.sensor_id
+    return [
+        measurement_dict(row, server_time, sources_by_measurement.get(row.id, {}))
+        for row in ordered_rows
+    ]
 
 
-def measurement_dict(row: MeasurementRow) -> dict:
+def measurement_dict(
+    row: MeasurementRow,
+    server_time: datetime | None = None,
+    sensor_ids: dict[str, int] | None = None,
+) -> dict:
+    server_time = server_time or datetime.now(timezone.utc)
+    recorded_at = row.recorded_at
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
     return {
         "id": row.id,
         "machine_id": row.machine_id,
@@ -491,13 +744,18 @@ def measurement_dict(row: MeasurementRow) -> dict:
         "current_rms": row.current_rms,
         "current_source": row.current_source,
         "acquisition_mode": row.acquisition_mode,
+        "sensor_ids": sensor_ids or {},
         "recorded_at": row.recorded_at,
+        "received_at": row.received_at,
+        "server_time": server_time,
+        "age_seconds": max(0, (server_time - recorded_at).total_seconds()),
     }
 
 
 @router.get("/alerts")
 def alerts(
-    status_filter: Literal["new", "acknowledged", "closed"] | None = Query(None, alias="status"),
+    status_filter: Literal["new", "acknowledged", "closed", "false_positive"] | None = Query(None, alias="status"),
+    acquisition_mode: Literal["hardware", "simulated", "unknown"] | None = Query(None),
     user: UserRow = Depends(current_user),
     db: Session = Depends(get_db),
 ):
@@ -512,20 +770,14 @@ def alerts(
         )
     if status_filter:
         stmt = stmt.where(AlertRow.status == status_filter)
-    rows = db.scalars(stmt).all()
+    if acquisition_mode in ("hardware", "simulated"):
+        stmt = stmt.where(AlertRow.acquisition_mode == acquisition_mode)
+    elif acquisition_mode == "unknown":
+        stmt = stmt.where(AlertRow.acquisition_mode.is_(None))
+    rows = db.scalars(stmt.order_by(desc(AlertRow.created_at), desc(AlertRow.id))).all()
+    events = alert_creation_events(db, [row.id for row in rows])
     return [
-        {
-            "id": row.id,
-            "machine_id": row.machine_id,
-            "machine_name": db.get(MachineRow, row.machine_id).name,
-            "metric": row.metric,
-            "severity": row.severity,
-            "value": row.value,
-            "status": row.status,
-            "created_at": row.created_at,
-            "acknowledged_by_id": row.acknowledged_by_id,
-            "acknowledged_at": row.acknowledged_at,
-        }
+        alert_dict(row, db.get(MachineRow, row.machine_id), events.get(row.id))
         for row in rows
     ]
 
@@ -592,6 +844,8 @@ def alert_history(
             "details": row.details,
             "user_name": (db.get(UserRow, row.user_id).full_name if row.user_id and db.get(UserRow, row.user_id) else ""),
             "created_at": row.created_at,
+            "source_measurement_id": row.source_measurement_id,
+            "processing_delay_ms": row.processing_delay_ms,
         }
         for row in rows
     ]
@@ -607,7 +861,7 @@ def close_alert(
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Alerte introuvable")
     require_machine_access(db, user, row.machine_id)
-    if row.status != "closed":
+    if row.status not in {"closed", "false_positive"}:
         row.status, row.closed_at = "closed", datetime.now(timezone.utc)
         db.add(AlertEventRow(alert_id=row.id, user_id=user.id, action="closed"))
         failure = db.scalar(
@@ -676,6 +930,18 @@ def assign_intervention(
         alert = db.get(AlertRow, data.alert_id)
         if alert is None or alert.machine_id != data.machine_id:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "L'alerte ne correspond pas à cette machine")
+    confirmed_failure = None
+    if data.failure_id is not None:
+        confirmed_failure = db.get(ManagerFailureRow, data.failure_id)
+        if (
+            confirmed_failure is None
+            or confirmed_failure.machine_id != data.machine_id
+            or confirmed_failure.resolved_at is not None
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "La panne sélectionnée est introuvable, clôturée ou liée à une autre machine.",
+            )
     row = InterventionRow(
         machine_id=data.machine_id,
         alert_id=data.alert_id,
@@ -690,8 +956,10 @@ def assign_intervention(
     )
     db.add(row)
     db.flush()
+    if confirmed_failure is not None:
+        confirmed_failure.intervention_id = row.id
     grant_machine_access(db, machine.id, technician.id, manager.id)
-    add_technician_notification(
+    notification = add_technician_notification(
         db,
         technician.id,
         f"intervention-assigned:{row.id}:{row.revision}",
@@ -701,6 +969,7 @@ def assign_intervention(
         str(row.id),
     )
     db.commit()
+    dispatch_web_push(db, [notification] if notification is not None else [])
     db.refresh(row)
     return intervention_dict(row, db)
 
@@ -714,7 +983,9 @@ def list_interventions(
 ):
     if user.role not in ("technician", "manager", "director", "admin"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Permission insuffisante")
-    stmt = select(InterventionRow).order_by(desc(InterventionRow.created_at)).limit(300)
+    stmt = select(InterventionRow).order_by(desc(InterventionRow.created_at))
+    if user.role != "technician":
+        stmt = stmt.limit(300)
     if user.role == "technician":
         stmt = stmt.where(
             or_(
@@ -737,6 +1008,165 @@ def list_interventions(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Statut d'intervention non reconnu")
         stmt = stmt.where(InterventionRow.status == status_filter)
     return [intervention_dict(row, db) for row in db.scalars(stmt).all()]
+
+
+def require_intervention_access(
+    db: Session,
+    user: UserRow,
+    intervention_id: int,
+) -> InterventionRow:
+    row = db.get(InterventionRow, intervention_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Intervention introuvable")
+    if user.role == "technician":
+        is_assignee = row.assigned_to_id == user.id or (
+            row.assigned_to_id is None and row.user_id == user.id
+        )
+        if not is_assignee or not can_access_machine(db, user, row.machine_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Intervention introuvable")
+    return row
+
+
+def intervention_photo_dict(row: InterventionPhotoRow) -> dict:
+    return {
+        "id": row.id,
+        "intervention_id": row.intervention_id,
+        "original_name": row.original_name,
+        "content_type": row.content_type,
+        "size_bytes": row.size_bytes,
+        "uploaded_by_id": row.uploaded_by_id,
+        "created_at": row.created_at,
+    }
+
+
+def image_type(header: bytes) -> tuple[str, str] | None:
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None
+
+
+@router.post("/interventions/{intervention_id}/photos", status_code=status.HTTP_201_CREATED)
+async def upload_intervention_photo(
+    intervention_id: int,
+    photo: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles(*MAINTENANCE)),
+):
+    require_intervention_access(db, user, intervention_id)
+    await photo.seek(0)
+    kind = image_type(await photo.read(12))
+    await photo.seek(0)
+    if kind is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Format non accepté. Utilisez une image JPEG, PNG ou WebP.",
+        )
+    content_type, extension = kind
+    directory = Path(settings.intervention_photo_directory)
+    temporary_path: Path | None = None
+    stored_path: Path | None = None
+    committed = False
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        storage_name = f"{uuid.uuid4().hex}.{extension}"
+        temporary_path = directory / f".{storage_name}.tmp"
+        stored_path = directory / storage_name
+        size_bytes = 0
+        with temporary_path.open("xb") as destination:
+            while chunk := await photo.read(64 * 1024):
+                size_bytes += len(chunk)
+                if size_bytes > MAX_INTERVENTION_PHOTO_BYTES:
+                    raise HTTPException(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        "La photo ne peut pas dépasser 8 Mio.",
+                    )
+                destination.write(chunk)
+        if size_bytes == 0:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Le fichier est vide.")
+        temporary_path.replace(stored_path)
+        original_name = re.split(r"[\\/]", photo.filename or "photo")[-1]
+        original_name = "".join(char for char in original_name if char.isprintable())[:255] or "photo"
+        row = InterventionPhotoRow(
+            intervention_id=intervention_id,
+            uploaded_by_id=user.id,
+            storage_name=storage_name,
+            original_name=original_name,
+            content_type=content_type,
+            size_bytes=size_bytes,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        committed = True
+        return intervention_photo_dict(row)
+    except HTTPException:
+        raise
+    except (OSError, SQLAlchemyError):
+        db.rollback()
+        logger.exception("Échec du stockage d'une photo d'intervention (intervention_id=%s)", intervention_id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "La photo n'a pas pu être enregistrée.",
+        )
+    finally:
+        if not committed:
+            for path in (temporary_path, stored_path):
+                if path is not None and path.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        logger.exception(
+                            "Impossible de nettoyer un fichier photo temporaire (intervention_id=%s)",
+                            intervention_id,
+                        )
+
+
+@router.get("/interventions/{intervention_id}/photos")
+def list_intervention_photos(
+    intervention_id: int,
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles(*MAINTENANCE)),
+):
+    require_intervention_access(db, user, intervention_id)
+    rows = db.scalars(
+        select(InterventionPhotoRow)
+        .where(InterventionPhotoRow.intervention_id == intervention_id)
+        .order_by(InterventionPhotoRow.created_at, InterventionPhotoRow.id)
+    ).all()
+    return [intervention_photo_dict(row) for row in rows]
+
+
+@router.get("/interventions/{intervention_id}/photos/{photo_id}")
+def download_intervention_photo(
+    intervention_id: int,
+    photo_id: int,
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles(*MAINTENANCE)),
+):
+    require_intervention_access(db, user, intervention_id)
+    row = db.get(InterventionPhotoRow, photo_id)
+    if row is None or row.intervention_id != intervention_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Photo introuvable")
+    if not re.fullmatch(r"[0-9a-f]{32}\.(jpg|png|webp)", row.storage_name):
+        logger.error("Nom de stockage photo invalide (photo_id=%s)", row.id)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Photo introuvable")
+    path = Path(settings.intervention_photo_directory) / row.storage_name
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Fichier photo indisponible")
+    return FileResponse(
+        path,
+        media_type=row.content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{row.storage_name}"',
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.patch("/interventions/{intervention_id}")
@@ -832,8 +1262,9 @@ def update_intervention(
             "Cette intervention a été modifiée depuis la dernière synchronisation. Actualisez-la avant de réessayer.",
         )
     db.refresh(row)
+    notification = None
     if row.assigned_to_id:
-        add_technician_notification(
+        notification = add_technician_notification(
             db,
             row.assigned_to_id,
             f"intervention-updated:{row.id}:{row.revision}",
@@ -851,12 +1282,14 @@ def update_intervention(
             )
         )
     db.commit()
+    dispatch_web_push(db, [notification] if notification is not None else [])
     db.refresh(row)
     return intervention_dict(row, db)
 
 
 @router.get("/technician/overview")
 def technician_overview(
+    acquisition_mode: Literal["hardware", "simulated"] | None = Query(None),
     db: Session = Depends(get_db),
     user: UserRow = Depends(require_roles("technician")),
 ):
@@ -866,12 +1299,19 @@ def technician_overview(
     machines_rows = db.scalars(
         select(MachineRow).where(MachineRow.id.in_(machine_ids), MachineRow.active.is_(True))
     ).all()
-    active_alerts = db.scalar(
-        select(func.count()).select_from(AlertRow).where(
-            AlertRow.machine_id.in_(machine_ids),
-            AlertRow.status != "closed",
-        )
-    ) or 0
+    alert_count_stmt = (
+        select(func.count())
+        .select_from(AlertRow)
+        .where(AlertRow.machine_id.in_(machine_ids), AlertRow.status.not_in(("closed", "false_positive")))
+    )
+    latest_stmt = (
+        select(MeasurementRow)
+        .where(MeasurementRow.machine_id.in_(machine_ids))
+    )
+    if acquisition_mode is not None:
+        alert_count_stmt = alert_count_stmt.where(AlertRow.acquisition_mode == acquisition_mode)
+        latest_stmt = latest_stmt.where(MeasurementRow.acquisition_mode == acquisition_mode)
+    active_alerts = db.scalar(alert_count_stmt) or 0
     active_interventions = db.scalar(
         select(func.count()).select_from(InterventionRow).where(
             InterventionRow.assigned_to_id == user.id,
@@ -886,18 +1326,17 @@ def technician_overview(
         )
     ) or 0
     latest = db.scalar(
-        select(MeasurementRow)
-        .where(MeasurementRow.machine_id.in_(machine_ids))
-        .order_by(desc(MeasurementRow.recorded_at))
-        .limit(1)
+        latest_stmt.order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id)).limit(1)
     )
+    server_time = datetime.now(timezone.utc)
     return {
+        "server_time": server_time,
         "machine_count": len(machines_rows),
         "online_count": sum(machine.status == "online" for machine in machines_rows),
         "active_alert_count": active_alerts,
         "active_intervention_count": active_interventions,
         "overdue_intervention_count": overdue_interventions,
-        "latest": measurement_dict(latest) if latest else None,
+        "latest": measurement_dict(latest, server_time) if latest else None,
     }
 
 
@@ -1069,9 +1508,10 @@ def list_user_notifications(
             InterventionRow.due_at >= now,
         )
     ).all()
+    reminder_notifications = []
     for intervention in reminders:
         due_day = _utc(intervention.due_at).date().isoformat()
-        add_technician_notification(
+        notification = add_technician_notification(
             db,
             user.id,
             f"intervention-due:{intervention.id}:{due_day}",
@@ -1080,8 +1520,11 @@ def list_user_notifications(
             "intervention",
             str(intervention.id),
         )
+        if notification is not None:
+            reminder_notifications.append(notification)
     if reminders:
         db.commit()
+        dispatch_web_push(db, reminder_notifications)
     account_rows = db.scalars(
         select(UserNotificationRow)
         .where(UserNotificationRow.user_id == user.id)
@@ -1102,6 +1545,9 @@ def list_user_notifications(
             "target_type": "",
             "target_id": "",
             "created_at": row.created_at,
+            "push_sent_at": None,
+            "received_at": None,
+            "delivery_delay_ms": None,
             "read": row.read_at is not None,
         }
         for row in account_rows
@@ -1113,11 +1559,108 @@ def list_user_notifications(
             "target_type": row.target_type,
             "target_id": row.target_id,
             "created_at": row.created_at,
+            "push_sent_at": row.push_sent_at,
+            "received_at": row.received_at,
+            "delivery_delay_ms": (
+                max(0, int((_utc(row.received_at) - _utc(row.created_at)).total_seconds() * 1000))
+                if row.received_at is not None
+                else None
+            ),
             "read": row.read_at is not None,
         }
         for row in technician_rows
     ]
     return sorted(combined, key=lambda row: row["created_at"], reverse=True)
+
+
+@router.get("/notifications/push/vapid-key")
+def push_vapid_key(_: UserRow = Depends(require_roles("technician"))):
+    enabled = web_push_is_configured()
+    return {
+        "enabled": enabled,
+        "public_key": settings.web_push_vapid_public_key if enabled else None,
+    }
+
+
+@router.post("/notifications/push/subscriptions", status_code=status.HTTP_201_CREATED)
+def create_push_subscription(
+    data: PushSubscriptionInput,
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles("technician")),
+):
+    if not web_push_is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Les notifications Push ne sont pas configurées sur ce serveur",
+        )
+    existing = db.scalar(
+        select(PushSubscriptionRow).where(PushSubscriptionRow.endpoint == data.endpoint)
+    )
+    if existing is not None and existing.user_id != user.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cette inscription Push est déjà associée à un autre compte",
+        )
+    if existing is None:
+        db.add(
+            PushSubscriptionRow(
+                user_id=user.id,
+                endpoint=data.endpoint,
+                p256dh=data.p256dh,
+                auth=data.auth,
+            )
+        )
+    else:
+        existing.p256dh = data.p256dh
+        existing.auth = data.auth
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cette inscription Push existe déjà.",
+        ) from exc
+    return {"subscribed": True}
+
+
+@router.delete("/notifications/push/subscriptions")
+def delete_push_subscription(
+    data: PushSubscriptionDeleteInput,
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles("technician")),
+):
+    existing = db.scalar(
+        select(PushSubscriptionRow).where(
+            PushSubscriptionRow.endpoint == data.endpoint,
+            PushSubscriptionRow.user_id == user.id,
+        )
+    )
+    if existing is not None:
+        db.delete(existing)
+        db.commit()
+    return {"subscribed": False}
+
+
+@router.post("/notifications/received")
+def record_notification_receipt(
+    data: NotificationReceiptInput,
+    db: Session = Depends(get_db),
+    user: UserRow = Depends(require_roles("technician")),
+):
+    rows = db.scalars(
+        select(TechnicianNotificationRow).where(
+            TechnicianNotificationRow.id.in_(data.notification_ids),
+            TechnicianNotificationRow.user_id == user.id,
+            TechnicianNotificationRow.received_at.is_(None),
+        )
+    ).all()
+    received_at = datetime.now(timezone.utc)
+    for row in rows:
+        row.received_at = received_at
+    if rows:
+        db.commit()
+    return {"recorded": len(rows), "received_at": received_at}
 
 
 @router.post("/notifications/{notification_id}/read")
@@ -1329,7 +1872,11 @@ def complete_password_reset(
 
 
 @router.get("/dashboard")
-def dashboard(user: UserRow = Depends(current_user), db: Session = Depends(get_db)):
+def dashboard(
+    acquisition_mode: Literal["hardware", "simulated"] | None = Query(None),
+    user: UserRow = Depends(current_user),
+    db: Session = Depends(get_db),
+):
     machine_stmt = select(MachineRow)
     if user.role == "technician":
         machine_stmt = machine_stmt.join(
@@ -1342,7 +1889,7 @@ def dashboard(user: UserRow = Depends(current_user), db: Session = Depends(get_d
     elif user.role != "manager":
         machine_stmt = machine_stmt.where(MachineRow.active.is_(True))
     machines_rows = db.scalars(machine_stmt).all()
-    alert_stmt = select(AlertRow).where(AlertRow.status != "closed")
+    alert_stmt = select(AlertRow).where(AlertRow.status.not_in(("closed", "false_positive")))
     latest_stmt = select(MeasurementRow)
     if user.role == "technician":
         accessible_ids = select(MachineTechnicianAccessRow.machine_id).where(
@@ -1350,9 +1897,15 @@ def dashboard(user: UserRow = Depends(current_user), db: Session = Depends(get_d
         )
         alert_stmt = alert_stmt.where(AlertRow.machine_id.in_(accessible_ids))
         latest_stmt = latest_stmt.where(MeasurementRow.machine_id.in_(accessible_ids))
+    if acquisition_mode is not None:
+        alert_stmt = alert_stmt.where(AlertRow.acquisition_mode == acquisition_mode)
+        latest_stmt = latest_stmt.where(MeasurementRow.acquisition_mode == acquisition_mode)
     active_alerts = db.scalars(alert_stmt).all()
-    latest = db.scalars(latest_stmt.order_by(desc(MeasurementRow.recorded_at)).limit(1)).first()
+    latest = db.scalars(
+        latest_stmt.order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id)).limit(1)
+    ).first()
     return {
+        "server_time": datetime.now(timezone.utc),
         "role": user.role,
         "machine_count": len(machines_rows),
         "online_count": sum(row.status == "online" for row in machines_rows),
