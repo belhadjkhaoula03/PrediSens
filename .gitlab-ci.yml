@@ -105,7 +105,7 @@ docker-build:
     expire_in: 1 hour
   rules:
     - exists:
-        - $BACKEND_DIR/Dockerfile
+        - backend/Dockerfile
 
 # ---------- 5. SCAN THE IMAGE ----------
 trivy-image:
@@ -115,8 +115,7 @@ trivy-image:
     entrypoint: [""]
   script:
     - trivy image --input image.tar --severity HIGH,CRITICAL --exit-code 1
-  needs: [docker-build]
   allow_failure: true
   rules:
     - exists:
-        - $BACKEND_DIR/Dockerfile
+        - backend/Dockerfile
