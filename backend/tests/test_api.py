@@ -45,12 +45,12 @@ def test_web_shell_uses_versioned_assets_and_root_service_worker(client):
     page = client.get("/")
     assert page.status_code == 200
     assert page.headers["cache-control"] == "no-cache"
-    assert '/static/styles.css?v=30' in page.text
-    assert '/static/measurement-ui.js?v=30' in page.text
-    assert '/static/profile.js?v=30' in page.text
-    assert '/static/director.js?v=30' in page.text
-    assert '/static/app.js?v=30' in page.text
-    assert '/static/technician.js?v=30' in page.text
+    assert '/static/styles.css?v=36' in page.text
+    assert '/static/measurement-ui.js?v=36' in page.text
+    assert '/static/profile.js?v=36' in page.text
+    assert '/static/director.js?v=36' in page.text
+    assert '/static/app.js?v=36' in page.text
+    assert '/static/technician.js?v=36' in page.text
     assert 'data-admin-page="sensor-replacements"' in page.text
     assert 'data-admin-page="backups"' in page.text
     assert 'id="director-app"' in page.text
@@ -59,13 +59,13 @@ def test_web_shell_uses_versioned_assets_and_root_service_worker(client):
     assert 'data-manager-page="performance"' in page.text
     assert 'data-manager-page="comparison"' in page.text
     assert 'id="manager-performance-kpis"' in page.text
-    worker = client.get("/service-worker.js?v=30")
+    worker = client.get("/service-worker.js?v=36")
     assert worker.status_code == 200
     assert worker.headers["service-worker-allowed"] == "/"
     assert worker.headers["cache-control"] == "no-cache"
-    assert "/static/measurement-ui.js?v=30" in worker.text
-    assert "/static/director.js?v=30" in worker.text
-    assert "/static/technician.js?v=30" in worker.text
+    assert "/static/measurement-ui.js?v=36" in worker.text
+    assert "/static/director.js?v=36" in worker.text
+    assert "/static/technician.js?v=36" in worker.text
 
 def test_login_and_machine_requires_auth(client):
     assert client.get("/api/machines").status_code == 401
