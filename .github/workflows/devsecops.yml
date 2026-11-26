@@ -1,0 +1,87 @@
+
+name: devsecops
+
+on:
+  push:
+  pull_request:
+
+env:
+  BACKEND_DIR: backend
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install flake8
+      - run: flake8 $BACKEND_DIR --max-line-length=120 --exclude=.venv,__pycache__
+
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r $BACKEND_DIR/requirements.txt pytest
+      - run: pytest -q || [ $? -eq 5 ]
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source /repo --no-banner
+
+  sast-bandit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install bandit
+      - run: bandit -r $BACKEND_DIR -ll
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - run: pip-audit -r $BACKEND_DIR/requirements.txt
+
+  k8s-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy config scan
+        if: hashFiles('k8s/**') != ''
+        run: docker run --rm -v "$PWD:/src" aquasec/trivy:latest config --severity HIGH,CRITICAL --exit-code 1 /src/k8s
+
+  docker-build-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        if: hashFiles('backend/Dockerfile') != ''
+        run: docker build -t predimaint-backend:${{ github.sha }} $BACKEND_DIR
+      - name: Trivy image scan
+        if: hashFiles('backend/Dockerfile') != ''
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:latest image --severity HIGH,CRITICAL --exit-code 1
+          predimaint-backend:${{ github.sha }}
