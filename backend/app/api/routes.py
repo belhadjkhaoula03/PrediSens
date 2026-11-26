@@ -86,7 +86,7 @@ class InterventionAssignmentInput(BaseModel):
     title: str = Field(min_length=2, max_length=200)
     description: str = Field(min_length=3, max_length=4000)
     priority: Literal["low", "normal", "high", "urgent"] = "normal"
-    due_at: datetime | None = None
+    due_at: datetime
     alert_id: int | None = None
     failure_id: int | None = Field(default=None, gt=0)
 
@@ -299,6 +299,8 @@ def intervention_dict(row: InterventionRow, db: Session) -> dict:
         "duration_minutes": row.duration_minutes,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        "accepted_at": row.accepted_at,
+        "completed_at": row.completed_at,
         "resolved_at": row.resolved_at,
         "revision": row.revision,
     }
@@ -358,21 +360,69 @@ def me(user: UserRow = Depends(current_user)):
     }
 
 
+# Un capteur activé qui n'a envoyé aucune mesure depuis ce délai est considéré inactif.
+SENSOR_INACTIVE_AFTER_SECONDS = 120
+
+
+def inactive_sensor_metrics(
+    db: Session,
+    machine_ids: list[str],
+    now: datetime | None = None,
+) -> dict[str, list[str]]:
+    """Retourne, par machine, les mesures dont le capteur activé est inactif.
+
+    Une machine dont aucun capteur n'a encore jamais transmis de mesure
+    n'est pas concernée : on conserve alors son statut enregistré.
+    """
+    if not machine_ids:
+        return {}
+    reference = _utc(now or datetime.now(timezone.utc))
+    sensors = db.scalars(
+        select(SensorRow).where(SensorRow.machine_id.in_(machine_ids), SensorRow.enabled.is_(True))
+    ).all()
+    if not sensors:
+        return {}
+    last_seen_rows = db.execute(
+        select(MeasurementSensorSourceRow.sensor_id, func.max(MeasurementRow.recorded_at))
+        .join(MeasurementRow, MeasurementRow.id == MeasurementSensorSourceRow.measurement_id)
+        .where(MeasurementSensorSourceRow.sensor_id.in_([sensor.id for sensor in sensors]))
+        .group_by(MeasurementSensorSourceRow.sensor_id)
+    ).all()
+    last_seen = {sensor_id: seen_at for sensor_id, seen_at in last_seen_rows}
+    machines_with_data = {sensor.machine_id for sensor in sensors if sensor.id in last_seen}
+    limit = reference - timedelta(seconds=SENSOR_INACTIVE_AFTER_SECONDS)
+    result: dict[str, list[str]] = {}
+    for sensor in sensors:
+        if sensor.machine_id not in machines_with_data:
+            continue
+        seen_at = last_seen.get(sensor.id)
+        if seen_at is None or _utc(seen_at) < limit:
+            result.setdefault(sensor.machine_id, []).append(sensor.metric)
+    return result
+
+
 def machine_dict(
     machine: MachineRow,
     latest_measurement: MeasurementRow | None = None,
     server_time: datetime | None = None,
+    inactive_sensors: list[str] | None = None,
 ) -> dict:
     if server_time is None:
         server_time = datetime.now(timezone.utc)
     recorded_at = latest_measurement.recorded_at if latest_measurement else None
     if recorded_at is not None and recorded_at.tzinfo is None:
         recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    # Un capteur en panne (aucune mesure récente) met la machine « en panne ».
+    effective_status = machine.status
+    if inactive_sensors and machine.active and effective_status == "online":
+        effective_status = "fault"
     return {
         "id": machine.id,
         "name": machine.name,
         "description": machine.description,
-        "status": machine.status,
+        "status": effective_status,
+        "sensor_fault": bool(inactive_sensors),
+        "inactive_sensors": list(inactive_sensors or []),
         "active": machine.active,
         "last_seen": machine.last_seen,
         "last_measurement_mode": (
@@ -468,7 +518,12 @@ def machine_details(
     ) or 0
     server_time = datetime.now(timezone.utc)
     return {
-        "machine": machine_dict(machine, latest, server_time),
+        "machine": machine_dict(
+            machine,
+            latest,
+            server_time,
+            inactive_sensor_metrics(db, [machine_id], server_time).get(machine_id),
+        ),
         "sensors": [sensor_dict(sensor) for sensor in sensors],
         "latest_measurement": (
             measurement_dict(latest, server_time, sensor_ids) if latest is not None else None
@@ -522,8 +577,9 @@ def machines(user: UserRow = Depends(current_user), db: Session = Depends(get_db
         for measurement in measurements:
             latest_by_machine[measurement.machine_id] = measurement
     server_time = datetime.now(timezone.utc)
+    inactive_by_machine = inactive_sensor_metrics(db, machine_ids, server_time)
     return [
-        machine_dict(row, latest_by_machine.get(row.id), server_time)
+        machine_dict(row, latest_by_machine.get(row.id), server_time, inactive_by_machine.get(row.id))
         for row in machine_rows
     ]
 
@@ -926,6 +982,11 @@ def assign_intervention(
     technician = db.get(UserRow, data.assigned_to_id)
     if technician is None or technician.role != "technician" or not technician.active:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Le compte sélectionné n'est pas un technicien actif")
+    if _utc(data.due_at) <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "L’échéance doit être une date et une heure futures. Une date passée n’est pas autorisée.",
+        )
     if data.alert_id is not None:
         alert = db.get(AlertRow, data.alert_id)
         if alert is None or alert.machine_id != data.machine_id:
@@ -1210,10 +1271,20 @@ def update_intervention(
             "Cette intervention a été modifiée depuis la dernière synchronisation. Actualisez-la avant de réessayer.",
         )
 
+    now = datetime.now(timezone.utc)
     if user.role == "technician":
         forbidden = set(values) - {"status", "diagnosis", "work_done", "result"}
         if forbidden:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Vous ne pouvez modifier que le suivi de votre intervention")
+        # A technician must not accept, start, continue, or close an intervention
+        # whose scheduled deadline has already passed (or was never set).
+        technician_tracking_fields = {"status", "diagnosis", "work_done", "result"}
+        if row.status in {"assigned", "accepted", "in_progress"} and (set(values) & technician_tracking_fields):
+            if _deadline_is_passed(row.due_at, now):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Intervention bloquée : son échéance est dépassée ou non définie. Contactez le responsable pour fixer une nouvelle échéance future.",
+                )
         if values.get("status") == "completed" and not values.get("work_done", row.work_done).strip():
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1221,7 +1292,7 @@ def update_intervention(
             )
         if "status" in values:
             allowed_transitions = {
-                "assigned": {"accepted", "in_progress"},
+                "assigned": {"accepted"},
                 "accepted": {"in_progress", "completed"},
                 "in_progress": {"completed"},
                 "completed": set(),
@@ -1239,13 +1310,36 @@ def update_intervention(
             grant_machine_access(db, row.machine_id, technician.id, user.id)
             values["assigned_to_id"] = technician.id
 
+    if "due_at" in values and (values["due_at"] is None or _deadline_is_passed(values["due_at"], now)):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "L’échéance est obligatoire et doit être une date et une heure futures. Une date passée ou vide n’est pas autorisée.",
+        )
+
     status_changed = values.get("status") is not None and values["status"] != row.status
-    now = datetime.now(timezone.utc)
+    target_status = values.get("status")
+    effective_due_at = values.get("due_at", row.due_at)
+    if status_changed and target_status in {"accepted", "in_progress", "completed"} and _deadline_is_passed(effective_due_at, now):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Intervention bloquée : son échéance est dépassée ou non définie. Le responsable doit définir une nouvelle échéance future avant toute reprise.",
+        )
     persisted_values = dict(values)
     persisted_values["updated_at"] = now
     persisted_values["revision"] = InterventionRow.revision + 1
     if status_changed:
-        persisted_values["resolved_at"] = now if values["status"] in {"completed", "cancelled"} else None
+        target_status = values["status"]
+        if target_status in {"accepted", "in_progress", "completed"} and row.accepted_at is None:
+            persisted_values["accepted_at"] = now
+        if target_status == "completed":
+            accepted_at = row.accepted_at or now
+            persisted_values["accepted_at"] = accepted_at
+            persisted_values["completed_at"] = now
+            persisted_values["duration_minutes"] = max(
+                0,
+                int((_utc(now) - _utc(accepted_at)).total_seconds() // 60),
+            )
+        persisted_values["resolved_at"] = now if target_status in {"completed", "cancelled"} else None
     changed = db.execute(
         update(InterventionRow)
         .where(
@@ -1263,7 +1357,31 @@ def update_intervention(
         )
     db.refresh(row)
     notification = None
-    if row.assigned_to_id:
+    manager_notification = None
+    if user.role == "technician":
+        # Le technicien n'a pas besoin d'être notifié de sa propre action :
+        # c'est le responsable qui a créé l'intervention qui est prévenu.
+        if row.user_id and row.user_id != user.id:
+            technician_name = user.full_name or user.email
+            if status_changed:
+                action = {
+                    "accepted": "a accepté",
+                    "in_progress": "a démarré",
+                    "completed": "a terminé",
+                    "cancelled": "a annulé",
+                }.get(row.status, "a mis à jour")
+            else:
+                action = "a mis à jour le suivi de"
+            manager_notification = add_technician_notification(
+                db,
+                row.user_id,
+                f"intervention-progress:{row.id}:{row.revision}",
+                "intervention_progress",
+                f"{technician_name} {action} l'intervention « {row.title} ».",
+                "intervention",
+                str(row.id),
+            )
+    elif row.assigned_to_id:
         notification = add_technician_notification(
             db,
             row.assigned_to_id,
@@ -1282,7 +1400,7 @@ def update_intervention(
             )
         )
     db.commit()
-    dispatch_web_push(db, [notification] if notification is not None else [])
+    dispatch_web_push(db, [item for item in (notification, manager_notification) if item is not None])
     db.refresh(row)
     return intervention_dict(row, db)
 
@@ -1329,10 +1447,14 @@ def technician_overview(
         latest_stmt.order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id)).limit(1)
     )
     server_time = datetime.now(timezone.utc)
+    inactive_by_machine = inactive_sensor_metrics(db, [machine.id for machine in machines_rows], server_time)
     return {
         "server_time": server_time,
         "machine_count": len(machines_rows),
-        "online_count": sum(machine.status == "online" for machine in machines_rows),
+        "online_count": sum(
+            machine.status == "online" and machine.id not in inactive_by_machine
+            for machine in machines_rows
+        ),
         "active_alert_count": active_alerts,
         "active_intervention_count": active_interventions,
         "overdue_intervention_count": overdue_interventions,
@@ -1752,7 +1874,18 @@ def _digest(value: str) -> str:
 
 
 def _utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    """Return a timezone-aware datetime normalized to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _deadline_is_passed(due_at: datetime | None, now: datetime | None = None) -> bool:
+    """Treat missing deadlines as blocked and compare timestamps in UTC."""
+    if due_at is None:
+        return True
+    reference = now or datetime.now(timezone.utc)
+    return _utc(due_at) <= _utc(reference)
 
 
 def _generic_reset_response() -> dict:
@@ -1904,11 +2037,15 @@ def dashboard(
     latest = db.scalars(
         latest_stmt.order_by(desc(MeasurementRow.recorded_at), desc(MeasurementRow.id)).limit(1)
     ).first()
+    inactive_by_machine = inactive_sensor_metrics(db, [row.id for row in machines_rows])
     return {
         "server_time": datetime.now(timezone.utc),
         "role": user.role,
         "machine_count": len(machines_rows),
-        "online_count": sum(row.status == "online" for row in machines_rows),
+        "online_count": sum(
+            row.status == "online" and row.id not in inactive_by_machine
+            for row in machines_rows
+        ),
         "active_alert_count": len(active_alerts),
         "latest": measurement_dict(latest) if latest else None,
     }

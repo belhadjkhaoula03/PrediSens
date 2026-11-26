@@ -49,7 +49,7 @@ async function registerAppShell() {
         .filter((registration) => new URL(registration.scope).pathname === "/static/")
         .map((registration) => registration.unregister()),
     );
-    await navigator.serviceWorker.register("/service-worker.js?v=27", {
+    await navigator.serviceWorker.register("/service-worker.js?v=31", {
       scope: "/",
       updateViaCache: "none",
     });
@@ -58,15 +58,218 @@ async function registerAppShell() {
   }
 }
 
+function machineStatusInfo(machine, suffix = "") {
+  if (machine?.status === "online") return { css: "", label: `En ligne${suffix}` };
+  if (machine?.status === "fault") {
+    const sensors = Array.isArray(machine.inactive_sensors) && machine.inactive_sensors.length
+      ? ` : capteur ${machine.inactive_sensors.map(escapeHtml).join(", ")} inactif` : "";
+    return { css: "offline", label: `En panne${sensors}` };
+  }
+  return { css: "offline", label: `Hors ligne${suffix}` };
+}
+
 function showToast(message) {
   $("#toast").textContent = message;
   $("#toast").classList.add("show");
   setTimeout(() => $("#toast").classList.remove("show"), 2600);
 }
 
+let notificationMonitorTimer = null;
+let notificationMonitorKnownIds = null;
+let notificationMonitorInFlight = false;
+
+const managerPhotoObjectUrls = new Set();
+
+function clearManagerPhotoObjectUrls() {
+  managerPhotoObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  managerPhotoObjectUrls.clear();
+}
+
+// Affiche les photos jointes par le technicien à une intervention (espace Responsable).
+async function loadManagerInterventionPhotos(panel) {
+  const interventionId = panel.dataset.managerPhotoPanel;
+  const gallery = panel.querySelector("[data-manager-photo-gallery]");
+  if (!gallery || gallery.dataset.loading === "true") return;
+
+  // A manager can open an intervention before its technician uploads evidence.
+  // Never treat an empty result as permanent: check again every time the panel
+  // is reopened so newly uploaded photos become visible without a page reload.
+  gallery.dataset.loading = "true";
+  for (const image of gallery.querySelectorAll('img[src^="blob:"]')) {
+    URL.revokeObjectURL(image.src);
+    managerPhotoObjectUrls.delete(image.src);
+  }
+  gallery.textContent = "Chargement des photos…";
+  try {
+    const photos = await api(`/interventions/${interventionId}/photos`, { cache: "no-store" });
+    const items = [];
+    for (const photo of photos) {
+      const response = await fetch(`/api/interventions/${interventionId}/photos/${photo.id}`, {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 401) {
+        logout();
+        throw new Error("Session expirée. Reconnectez-vous.");
+      }
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || `La photo « ${photo.original_name} » n’a pas pu être chargée.`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      managerPhotoObjectUrls.add(url);
+      items.push(`<figure><img src="${url}" alt="Photo de l’intervention ${escapeHtml(interventionId)}">
+        <figcaption>${escapeHtml(photo.original_name)} · ${formatDate(photo.created_at)}</figcaption></figure>`);
+    }
+    gallery.innerHTML = items.join("") || '<p class="muted">Aucune photo jointe pour le moment. Rouvrez cette section pour actualiser.</p>';
+  } catch (error) {
+    gallery.innerHTML = `<p class="inline-error" role="alert">${escapeHtml(error.message)}</p>`;
+  } finally {
+    gallery.dataset.loading = "false";
+  }
+}
+
+const NOTIFICATION_TOAST_MS = 180000; // 3 minutes
+const NOTIFICATION_TOAST_MAX = 4;
+
+function notificationHeading(type) {
+  return {
+    intervention_assigned: "Nouvelle intervention",
+    intervention_progress: "Suivi d’intervention",
+    intervention_updated: "Intervention mise à jour",    due_reminder: "Rappel d’échéance",
+  }[type] || "Nouvelle notification";
+}
+
+// Ouvre la page liée à la notification, selon le rôle connecté.
+function openNotificationTarget(item) {
+  const targetType = item.target_type || "";
+  if (role === "technician") {
+    const page = targetType === "intervention" ? "interventions"
+      : targetType === "alert" ? "alerts" : "notifications";
+    document.querySelector(`[data-tech-page="${page}"]`)?.click();
+  } else if (role === "manager") {
+    const page = targetType === "intervention" ? "interventions"
+      : targetType === "alert" ? "alerts" : "overview";
+    document.querySelector(`[data-manager-page="${page}"]`)?.click();
+  } else if (role === "director") {
+    document.querySelector('[data-director-page="notifications"]')?.click();
+  } else if (role === "admin") {
+    document.querySelector('[data-admin-page="notifications"]')?.click();
+  }
+}
+
+function showIncomingNotification(item) {
+  const container = $("#notification-toasts");
+  if (!container) return;
+  // Évite l'empilement : on ne garde que les dernières notifications à l'écran.
+  while (container.children.length >= NOTIFICATION_TOAST_MAX) container.firstElementChild.remove();
+  const toast = document.createElement("article");
+  toast.className = "incoming-notification";
+  toast.setAttribute("role", "status");
+  toast.tabIndex = 0;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "notification-close";
+  close.setAttribute("aria-label", "Fermer la notification");
+  close.textContent = "×";
+  const heading = document.createElement("strong");
+  heading.textContent = notificationHeading(item.type);
+  const message = document.createElement("p");
+  message.textContent = item.message || "Une nouvelle notification vous est adressée.";
+  const time = document.createElement("small");
+  time.textContent = item.created_at ? new Date(item.created_at).toLocaleString("fr-FR") : "À l’instant";
+  toast.append(close, heading, message, time);
+  container.append(toast);
+  const timer = window.setTimeout(() => toast.remove(), NOTIFICATION_TOAST_MS);
+  const dismiss = () => {
+    window.clearTimeout(timer);
+    toast.remove();
+  };
+  close.addEventListener("click", (event) => {
+    event.stopPropagation();
+    dismiss();
+  });
+  const open = async () => {
+    dismiss();
+    openNotificationTarget(item);
+    try {
+      await api(`/notifications/${encodeURIComponent(item.id)}/read`, { method: "POST" });
+    } catch (error) {
+      console.debug("Notification non marquée comme lue", error);
+    }
+  };
+  toast.addEventListener("click", open);
+  toast.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") void open();
+    if (event.key === "Escape") dismiss();
+  });
+}
+
+async function pollIncomingNotifications() {
+  if (!token || notificationMonitorInFlight) return;
+  const pollingToken = token;
+  notificationMonitorInFlight = true;
+  try {
+    const notifications = await api("/notifications");
+    if (!token || token !== pollingToken) return;
+    const rows = Array.isArray(notifications) ? notifications : [];
+    const currentIds = new Set(rows.map((item) => String(item.id)));
+    if (notificationMonitorKnownIds === null) {
+      // Initialize silently, but show messages generated just as the session opened.
+      const recentCutoff = Date.now() - 180000;
+      rows.filter((item) => !item.read && Date.parse(item.created_at) >= recentCutoff)
+        .slice().reverse().forEach(showIncomingNotification);
+      notificationMonitorKnownIds = currentIds;
+      return;
+    }
+    rows.filter((item) => !notificationMonitorKnownIds.has(String(item.id)))
+      .slice().reverse().forEach(showIncomingNotification);
+    currentIds.forEach((id) => notificationMonitorKnownIds.add(id));
+    if (notificationMonitorKnownIds.size > 500) notificationMonitorKnownIds = currentIds;
+  } catch (error) {
+    // A failed background poll must not interrupt the active page.
+    console.debug("Vérification des notifications indisponible", error);
+  } finally {
+    notificationMonitorInFlight = false;
+  }
+}
+
+function startNotificationMonitor() {
+  window.clearInterval(notificationMonitorTimer);
+  notificationMonitorKnownIds = null;
+  void pollIncomingNotifications();
+  notificationMonitorTimer = window.setInterval(() => void pollIncomingNotifications(), 5000);
+}
+
+function stopNotificationMonitor() {
+  window.clearInterval(notificationMonitorTimer);
+  notificationMonitorTimer = null;
+  notificationMonitorKnownIds = null;
+  notificationMonitorInFlight = false;
+  $("#notification-toasts")?.replaceChildren();
+}
+
+function localDateTimeInputValue(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function updateAssignmentDueMinimum() {
+  const input = $("#assignment-form [name='due_at']");
+  if (!input) return;
+  const minimum = new Date();
+  minimum.setSeconds(0, 0);
+  minimum.setMinutes(minimum.getMinutes() + 1);
+  input.min = localDateTimeInputValue(minimum);
+  input.setCustomValidity(input.value && new Date(input.value).getTime() <= Date.now()
+    ? "Choisissez une date et une heure futures."
+    : "");
+}
+
 function logout() {
   if (typeof window.predimaintBeforeLogout === "function" && !window.predimaintBeforeLogout()) return;
   window.dispatchEvent(new CustomEvent("predimaint:logout"));
+  stopNotificationMonitor();
   token = null;
   role = null;
   localStorage.removeItem("pm_token");
@@ -117,7 +320,7 @@ function formatMachine(machine) {
     <small class="muted">${machine.measurement_recorded_at
     ? `Dernière mesure ${measurementUi.modeBadge(machine.last_measurement_mode)} : ${measurementUi.formatDate(machine.measurement_recorded_at)} · ${escapeHtml(freshness.label)}`
     : "Aucune mesure récente"}</small></span>
-    <span class="status ${machine.status === "online" ? "" : "offline"}">${machine.status === "online" ? "En ligne (MQTT)" : "Hors ligne (MQTT)"}${machine.active ? "" : " · Archivée"}</span></div>`;
+    <span class="status ${machineStatusInfo(machine, " (MQTT)").css}">${machineStatusInfo(machine, " (MQTT)").label}${machine.active ? "" : " · Archivée"}</span></div>`;
 }
 
 function machineUiMarkReceived(machine) {
@@ -280,7 +483,7 @@ async function loadManagerPerformance() {
 
     $("#manager-performance-machines").innerHTML = result.machines.map((machine) => `<tr>
       <td>${escapeHtml(machine.name)}</td>
-      <td><span class="status ${machine.status === "online" ? "" : "offline"}">${machine.status === "online" ? "En ligne" : "Hors ligne"}</span></td>
+      <td><span class="status ${machineStatusInfo(machine).css}">${machineStatusInfo(machine).label}</span></td>
       <td>${machine.last_telemetry_at ? formatDate(machine.last_telemetry_at) : "Aucune télémétrie"}</td>
       <td>${formatPercent(machine.availability_percentage)}<small class="manager-cell-note">Couverture ${formatPercent(machine.coverage_percentage)}</small></td>
       <td>${formatHours(machine.mtbf_hours)}</td><td>${formatHours(machine.mttr_hours)}</td><td>${machine.confirmed_failure_count}</td>
@@ -414,10 +617,69 @@ async function refresh() {
         $("#manager-interventions").innerHTML = interventions.map((item) => {
           const machine = machines.find((candidate) => candidate.id === item.machine_id);
           const deadline = item.due_at ? formatDate(item.due_at) : "Non définie";
-          return `<div class="asset-row"><span><strong>${escapeHtml(item.title)}</strong>
-            <div class="asset-meta">${escapeHtml(machine ? machine.name : item.machine_id)} · ${escapeHtml(item.assigned_to_name || "Non attribuée")} · Échéance : ${escapeHtml(deadline)}</div></span>
-            <span class="status ${item.status === "completed" || item.status === "cancelled" ? "offline" : ""}">${escapeHtml(statuses[item.status] || item.status)}</span></div>`;
+          const deadlineTimestamp = item.due_at ? new Date(item.due_at).getTime() : Number.NaN;
+          const overdue = !["completed", "cancelled"].includes(item.status)
+            && (!Number.isFinite(deadlineTimestamp) || deadlineTimestamp <= Date.now());
+          const acceptance = item.accepted_at ? ` · Acceptée : ${formatDate(item.accepted_at)}` : "";
+          const completion = item.completed_at
+            ? ` · Terminée : ${formatDate(item.completed_at)} · Durée calculée : ${item.duration_minutes} min`
+            : item.duration_minutes ? ` · Durée déclarée : ${item.duration_minutes} min` : "";
+          const hasReport = Boolean(item.diagnosis || item.work_done || item.result);
+          const reportPanel = `<details class="intervention-photo-panel" data-manager-photo-panel="${item.id}">
+            <summary>Compte rendu et photos</summary>
+            ${hasReport ? `<div class="manager-intervention-report">
+              <p><strong>Diagnostic :</strong> ${escapeHtml(item.diagnosis || "Non renseigné")}</p>
+              <p><strong>Travail réalisé :</strong> ${escapeHtml(item.work_done || "Non renseigné")}</p>
+              <p><strong>Résultat :</strong> ${escapeHtml(item.result || "Non renseigné")}</p>
+            </div>` : '<p class="muted">Aucun compte rendu pour le moment.</p>'}
+            <div class="intervention-photo-gallery" data-manager-photo-gallery="${item.id}"></div>
+          </details>`;
+          return `<div class="asset-row intervention-row"><span><strong>${escapeHtml(item.title)}</strong>
+            <div class="asset-meta">${escapeHtml(machine ? machine.name : item.machine_id)} · ${escapeHtml(item.assigned_to_name || "Non attribuée")} · Échéance : ${escapeHtml(deadline)}${overdue ? ' · <strong class="overdue-label">ÉCHÉANCE DÉPASSÉE — INTERVENTION BLOQUÉE</strong>' : ""}${escapeHtml(acceptance)}${escapeHtml(completion)}</div></span>
+            <span class="status ${overdue ? "overdue" : item.status === "completed" || item.status === "cancelled" ? "offline" : ""}">${escapeHtml(overdue ? "Bloquée" : statuses[item.status] || item.status)}</span>
+            ${overdue ? `<form class="reschedule-intervention-form" data-intervention-id="${item.id}" data-revision="${item.revision}"><label>Nouvelle échéance<input name="due_at" type="datetime-local" required></label><button class="quiet" type="submit">Replanifier</button><span class="form-message muted" role="status"></span></form>` : ""}
+            ${reportPanel}</div>`;
         }).join("") || '<p class="empty">Aucune intervention enregistrée.</p>';
+        clearManagerPhotoObjectUrls();
+        document.querySelectorAll("[data-manager-photo-panel]").forEach((panel) => {
+          panel.addEventListener("toggle", () => {
+            if (panel.open) void loadManagerInterventionPhotos(panel);
+          });
+        });
+        document.querySelectorAll(".reschedule-intervention-form").forEach((form) => {
+          const dueInput = form.elements.namedItem("due_at");
+          const minimum = new Date();
+          minimum.setSeconds(0, 0);
+          minimum.setMinutes(minimum.getMinutes() + 1);
+          dueInput.min = localDateTimeInputValue(minimum);
+          form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const value = dueInput.value;
+            const message = $(".form-message", form);
+            if (!value || !Number.isFinite(new Date(value).getTime()) || new Date(value).getTime() <= Date.now()) {
+              dueInput.setCustomValidity("Choisissez une nouvelle échéance dans le futur.");
+              dueInput.reportValidity();
+              message.textContent = "La nouvelle échéance doit être future.";
+              message.classList.add("error");
+              return;
+            }
+            dueInput.setCustomValidity("");
+            try {
+              await api(`/interventions/${form.dataset.interventionId}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  due_at: new Date(value).toISOString(),
+                  expected_revision: Number(form.dataset.revision),
+                }),
+              });
+              showToast("Nouvelle échéance enregistrée");
+              await refresh();
+            } catch (error) {
+              message.textContent = error.message;
+              message.classList.add("error");
+            }
+          });
+        });
       } catch (error) {
         $("#manager-interventions").innerHTML = `<p class="inline-error" role="alert">${escapeHtml(error.message)}</p>`;
       }
@@ -488,6 +750,7 @@ async function start() {
   try {
     const me = await api("/auth/me");
     role = me.role;
+    startNotificationMonitor();
     if (role === "admin") {
       $("#login").classList.add("hidden");
       $("#forgot-password").classList.add("hidden");
@@ -654,6 +917,9 @@ $("#forgot-password-form").addEventListener("submit", async (event) => {
 });
 
 $("#assignment-machine").addEventListener("change", () => loadManagerFailures());
+$("#assignment-form [name='due_at']").addEventListener("focus", updateAssignmentDueMinimum);
+$("#assignment-form [name='due_at']").addEventListener("change", updateAssignmentDueMinimum);
+updateAssignmentDueMinimum();
 
 const resetToken = new URLSearchParams(location.hash.slice(1)).get("reset_token");
 if (resetToken) {
@@ -832,7 +1098,7 @@ $("#manager-comparison-form").addEventListener("submit", async (event) => {
       const threshold = thresholds.find((item) => item.metric === metric);
       const value = measurement ? measurement[metric] : null;
       return `<tr><td>${escapeHtml(machine ? machine.name : id)}</td>
-        <td>${machine?.status === "online" ? "En ligne" : "Hors ligne"}</td>
+        <td>${machineStatusInfo(machine).label}</td>
         <td>${measurement ? formatDate(measurement.recorded_at) : "Aucune mesure dans ce mode"}</td>
         <td>${formatTelemetryValue(value, 2)}</td><td>${threshold ? formatTelemetryValue(threshold.critical, 2) : "Non configuré"}</td></tr>`;
     }));
@@ -869,6 +1135,15 @@ $("#assignment-form").addEventListener("submit", async (event) => {
   const assignmentForm = event.currentTarget;
   const form = new FormData(assignmentForm);
   const dueAt = form.get("due_at");
+  const dueInput = assignmentForm.elements.namedItem("due_at");
+  updateAssignmentDueMinimum();
+  if (dueAt && (!Number.isFinite(new Date(dueAt).getTime()) || new Date(dueAt).getTime() <= Date.now())) {
+    dueInput.setCustomValidity("Choisissez une date et une heure futures.");
+    dueInput.reportValidity();
+    $("#assignment-message").textContent = "Impossible d’attribuer une intervention à une échéance passée.";
+    return;
+  }
+  dueInput.setCustomValidity("");
   try {
     await api("/interventions", {
       method: "POST",

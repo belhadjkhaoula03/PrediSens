@@ -89,6 +89,8 @@ def initialize_data():
             "work_done": "TEXT NOT NULL DEFAULT ''",
             "result": "TEXT NOT NULL DEFAULT ''",
             "updated_at": timestamp_type,
+            "accepted_at": timestamp_type,
+            "completed_at": timestamp_type,
             "resolved_at": timestamp_type,
             "revision": "INTEGER NOT NULL DEFAULT 1",
         },

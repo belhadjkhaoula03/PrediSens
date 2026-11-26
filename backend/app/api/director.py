@@ -820,6 +820,8 @@ def director_report(
             "status": intervention.status,
             "priority": intervention.priority,
             "created_at": intervention.created_at,
+            "accepted_at": intervention.accepted_at,
+            "completed_at": intervention.completed_at,
             "resolved_at": intervention.resolved_at,
             "duration_minutes": intervention.duration_minutes,
         }

@@ -174,6 +174,16 @@
     $("#technician-offline-banner").classList.toggle("hidden", online);
   }
 
+  function machineStatusInfo(machine, suffix = "") {
+    if (machine?.status === "online") return { css: "", label: `En ligne${suffix}` };
+    if (machine?.status === "fault") {
+      const sensors = Array.isArray(machine.inactive_sensors) && machine.inactive_sensors.length
+        ? ` : capteur ${machine.inactive_sensors.map(escapeHtml).join(", ")} inactif` : "";
+      return { css: "offline", label: `En panne${sensors}` };
+    }
+    return { css: "offline", label: `Hors ligne${suffix}` };
+  }
+
   function toast(message) {
     $("#toast").textContent = message;
     $("#toast").classList.add("show");
@@ -340,8 +350,10 @@
 
   function interventionCard(item, machines) {
     const open = ["assigned", "accepted", "in_progress"].includes(item.status);
+    const deadline = item.due_at ? new Date(item.due_at).getTime() : Number.NaN;
+    const overdue = open && (!Number.isFinite(deadline) || deadline <= Date.now());
     const allowedStatuses = {
-      assigned: ["assigned", "accepted", "in_progress"],
+      assigned: ["assigned"],
       accepted: ["accepted", "in_progress", "completed"],
       in_progress: ["in_progress", "completed"],
     }[item.status] || [item.status];
@@ -349,16 +361,20 @@
       <div class="tech-row-title"><div><p class="eyebrow">${escapeHtml(machineName(machines, item.machine_id))}</p><h3>${escapeHtml(item.title)}</h3></div>
         <span class="status ${item.priority === "urgent" || item.priority === "high" ? "offline" : ""}">${escapeHtml(item.priority)}</span></div>
       <p class="tech-description">${escapeHtml(item.description)}</p>
-      <div class="tech-meta"><span>${escapeHtml(stateNames[item.status] || item.status)}</span><span>Échéance : ${formatDate(item.due_at)}</span></div>
-      ${open ? `<form class="intervention-update-form" data-intervention-id="${item.id}" data-revision="${item.revision}">
-        <label>État<select name="status">
+      <div class="tech-meta"><span>${overdue ? "Bloquée — échéance dépassée" : escapeHtml(stateNames[item.status] || item.status)}</span><span>Échéance : ${formatDate(item.due_at)}</span></div>
+      ${overdue ? '<p class="inline-error" role="alert">Intervention bloquée : l’échéance est dépassée ou absente. Contactez le responsable pour définir une nouvelle échéance future.</p>' : ""}
+      ${item.accepted_at ? `<p class="tech-timing">Acceptée le : <strong>${formatDate(item.accepted_at)}</strong></p>` : ""}
+      ${item.completed_at ? `<p class="tech-timing">Terminée le : <strong>${formatDate(item.completed_at)}</strong> · Durée calculée : <strong>${item.duration_minutes} min</strong></p>` : ""}
+      ${open && !overdue ? `<form class="intervention-update-form" data-intervention-id="${item.id}" data-revision="${item.revision}" data-current-status="${item.status}">
+        ${item.status === "assigned" ? "" : `<label>État<select name="status">
           ${allowedStatuses.map((state) =>
     `<option value="${state}" ${item.status === state ? "selected" : ""}>${escapeHtml(stateNames[state])}</option>`
   ).join("")}
-        </select></label>
+        </select></label>`}
         <label>Diagnostic<textarea name="diagnosis" rows="2" maxlength="4000">${escapeHtml(item.diagnosis)}</textarea></label>
         <label>Travail réalisé<textarea name="work_done" rows="2" maxlength="4000">${escapeHtml(item.work_done)}</textarea></label>
         <label>Résultat<textarea name="result" rows="2" maxlength="4000">${escapeHtml(item.result)}</textarea></label>
+        ${item.status === "assigned" ? `<button class="primary" type="button" data-intervention-accept>Accepter l’intervention</button>` : ""}
         <button class="primary" type="submit">Enregistrer le suivi</button><span class="form-message muted" role="status"></span>
       </form>` : `<div class="tech-history-detail">
         <p><strong>Diagnostic :</strong> ${escapeHtml(item.diagnosis || "Non renseigné")}</p>
@@ -415,6 +431,32 @@
   }
 
   function bindInterventionCards() {
+    document.querySelectorAll("[data-intervention-accept]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const form = button.closest(".intervention-update-form");
+        const message = $(".form-message", form);
+        button.disabled = true;
+        try {
+          const values = Object.fromEntries(new FormData(form));
+          await api(`/interventions/${form.dataset.interventionId}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              status: "accepted",
+              diagnosis: values.diagnosis || "",
+              work_done: values.work_done || "",
+              result: values.result || "",
+              expected_revision: Number(form.dataset.revision),
+            }),
+          });
+          toast("Intervention acceptée. L’heure d’acceptation a été enregistrée.");
+          await render();
+        } catch (error) {
+          button.disabled = false;
+          message.textContent = error.message;
+          message.classList.add("error");
+        }
+      });
+    });
     document.querySelectorAll(".intervention-update-form").forEach((form) => {
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -443,22 +485,40 @@
         event.preventDefault();
         const input = $('input[type="file"]', form);
         const message = $(".form-message", form);
+        const button = $('button[type="submit"]', form);
+        const files = Array.from(input.files || []);
+        message.textContent = "";
+        message.classList.remove("error");
+        if (!files.length) {
+          message.textContent = "Sélectionnez au moins une photo avant de cliquer sur Joindre les photos.";
+          message.classList.add("error");
+          return;
+        }
+        button.disabled = true;
         try {
-          for (const file of input.files) {
+          let uploadedCount = 0;
+          for (const file of files) {
+            if (file.size > 8 * 1024 * 1024) {
+              throw new Error(`La photo « ${file.name} » dépasse la limite de 8 Mio.`);
+            }
             const body = new FormData();
-            body.append("photo", file);
+            body.append("photo", file, file.name);
             await api(`/interventions/${form.dataset.photoUpload}/photos`, {
               method: "POST",
               body,
             });
+            uploadedCount += 1;
           }
           form.reset();
           const panel = form.closest("[data-photo-panel]");
           if (panel.open) await loadInterventionPhotos(panel, true);
-          toast("Les photos ont été ajoutées à l’intervention.");
+          message.textContent = `${uploadedCount} photo(s) envoyée(s) et enregistrée(s) avec succès.`;
+          toast(`${uploadedCount} photo(s) ajoutée(s) à l’intervention.`);
         } catch (error) {
           message.textContent = error.message;
           message.classList.add("error");
+        } finally {
+          button.disabled = false;
         }
       });
     });
@@ -558,7 +618,7 @@
       const machineAlerts = alerts.filter((item) => item.machine_id === machine.id && item.status !== "closed").length;
       const machineInterventions = interventions.filter((item) => item.machine_id === machine.id && !["completed", "cancelled"].includes(item.status)).length;
       return `<article class="tech-intervention-card"><div class="tech-row-title"><h3>${escapeHtml(machine.name)}</h3>
-        <span class="status ${machine.status === "online" ? "" : "offline"}">${machine.status === "online" ? "En ligne (MQTT)" : "Hors ligne (MQTT)"}</span></div>
+        <span class="status ${machineStatusInfo(machine, " (MQTT)").css}">${machineStatusInfo(machine, " (MQTT)").label}</span></div>
         <p>${escapeHtml(machine.description || "Aucune description renseignée.")}</p>
         <div class="tech-meta"><span>${machineAlerts} alerte(s) active(s)</span><span>${machineInterventions} intervention(s) en cours</span></div>
         <small>${machine.measurement_recorded_at
@@ -624,7 +684,7 @@
       <div class="machine-detail-section"><h4>Équipement</h4>
         <p><strong>${escapeHtml(details.machine.name)}</strong> · Identifiant : ${escapeHtml(details.machine.id)}</p>
         <p>${escapeHtml(details.machine.description || "Aucune description renseignée.")}</p>
-        <p>État : ${escapeHtml(details.machine.status)} · Dernière activité : ${formatDate(details.machine.last_seen)}</p>
+        <p>État : ${machineStatusInfo(details.machine).label} · Dernière activité : ${formatDate(details.machine.last_seen)}</p>
       </div>
       <div class="machine-detail-section"><h4>Mesures les plus récentes</h4>
         ${latest ? `<p>Lecture #${escapeHtml(latest.seq)} · ${measurementUi.modeBadge(latest.acquisition_mode)} · Reçue le ${formatDate(latest.received_at || latest.recorded_at)}</p><div class="machine-readings">${latestValues}</div>` : latestValues}</div>
@@ -945,7 +1005,11 @@
   async function renderOffline(data) {
     const actions = readOfflineActions();
     const interventions = data["/interventions"] || [];
-    const availableInterventions = interventions.filter((item) => !["completed", "cancelled"].includes(item.status));
+    const availableInterventions = interventions.filter((item) => {
+      if (["completed", "cancelled"].includes(item.status)) return false;
+      const deadline = item.due_at ? new Date(item.due_at).getTime() : Number.NaN;
+      return Number.isFinite(deadline) && deadline > Date.now();
+    });
     const updatedAt = cachedUpdatedAt();
     $("#technician-page").innerHTML = `<div class="admin-stats">
       ${metricCard("Connexion", navigator.onLine ? "Disponible" : "Indisponible", "état de votre navigateur")}

@@ -148,13 +148,15 @@
   }
 
   function interventionRows(interventions) {
-    if (!interventions.length) return '<tr><td colspan="5" class="empty-state">Aucune intervention enregistrée sur cette période.</td></tr>';
+    if (!interventions.length) return '<tr><td colspan="7" class="empty-state">Aucune intervention enregistrée sur cette période.</td></tr>';
     return interventions.map((item) => `<tr>
       <td>${escapeHtml(item.title || "Intervention")}</td>
       <td>${escapeHtml(item.machine_name)}</td>
       <td>${escapeHtml(item.technician_name || "Non attribuée")}</td>
       <td>${escapeHtml(interventionStatuses[item.status] || "Statut inconnu")}</td>
-      <td>${item.duration_minutes ? `${escapeHtml(item.duration_minutes)} min déclarées` : "Non renseignée"}</td>
+      <td>${item.accepted_at ? escapeHtml(formatDate(item.accepted_at)) : "—"}</td>
+      <td>${item.completed_at ? escapeHtml(formatDate(item.completed_at)) : "—"}</td>
+      <td>${item.completed_at ? `${escapeHtml(item.duration_minutes ?? 0)} min calculées` : item.duration_minutes ? `${escapeHtml(item.duration_minutes)} min déclarées` : "Non renseignée"}</td>
     </tr>`).join("");
   }
 
@@ -282,7 +284,7 @@
         <p class="director-note-text">MTBF : ${report.mtbf.value_hours === null ? escapeHtml(report.mtbf.reason) : formatHours(report.mtbf.value_hours)} · MTTR : ${report.mttr.value_hours === null ? escapeHtml(report.mttr.reason) : formatHours(report.mttr.value_hours)}.</p>
         <p class="director-note-text">Coûts estimés : ${Object.entries(report.downtime_cost.costs_by_currency).map(([currency, value]) => money(value, currency)).join(" · ") || (report.downtime_cost.unpriced_downtime_hours > 0 ? "Tarif à renseigner" : "Aucun arrêt confirmé sur la période")} · ${formatDetailedHours(report.downtime_cost.unpriced_downtime_hours)} sans tarif.</p>
         <h3>Interventions enregistrées</h3>
-        <div class="director-table-wrap"><table class="director-table"><thead><tr><th>Intervention</th><th>Machine</th><th>Technicien</th><th>Statut</th><th>Durée déclarée</th></tr></thead>
+        <div class="director-table-wrap"><table class="director-table"><thead><tr><th>Intervention</th><th>Machine</th><th>Technicien</th><th>Statut</th><th>Acceptée le</th><th>Terminée le</th><th>Durée (min)</th></tr></thead>
           <tbody>${interventionRows(report.interventions)}</tbody></table></div>
         <h3>Événements critiques enregistrés</h3>
         <div class="director-table-wrap"><table class="director-table"><thead><tr><th>Date</th><th>Machine</th><th>Grandeur</th><th>Valeur</th><th>État / origine</th></tr></thead>
@@ -392,7 +394,7 @@
       ["Synthèse", "", "", "MTTR (h)", report.mttr.value_hours ?? "", "", report.mttr.reason || ""],
       ...Object.entries(report.downtime_cost.costs_by_currency).map(([currency, value]) =>
         ["Coût estimé", "", "", currency, value, "", "Estimation basée sur tarif horaire par machine"]),
-      ...report.interventions.map((item) => ["Intervention", "", item.machine_name, item.title, interventionStatuses[item.status] || "Statut inconnu", item.created_at, item.technician_name]),
+      ...report.interventions.map((item) => ["Intervention", "", item.machine_name, item.title, interventionStatuses[item.status] || "Statut inconnu", item.accepted_at || item.created_at, `Technicien : ${item.technician_name}; acceptée : ${item.accepted_at || "non suivie"}; terminée : ${item.completed_at || "non suivie"}; durée : ${item.completed_at ? `${item.duration_minutes ?? 0} min calculées` : item.duration_minutes ? `${item.duration_minutes} min déclarées` : "non renseignée"}`]),
       ...report.events.map((item) => ["Événement critique", "", item.machine_name, item.metric, eventStatus(item), item.detected_at, item.description]),
       ...report.failure_metrics.failures.map((item) => ["Panne confirmée", "", item.machine_name, item.failure_type, item.status, item.detected_at, item.resolved_at || "En cours"]),
     ];

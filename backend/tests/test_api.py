@@ -45,12 +45,12 @@ def test_web_shell_uses_versioned_assets_and_root_service_worker(client):
     page = client.get("/")
     assert page.status_code == 200
     assert page.headers["cache-control"] == "no-cache"
-    assert '/static/styles.css?v=27' in page.text
-    assert '/static/measurement-ui.js?v=27' in page.text
-    assert '/static/profile.js?v=27' in page.text
-    assert '/static/director.js?v=27' in page.text
-    assert '/static/app.js?v=27' in page.text
-    assert '/static/technician.js?v=27' in page.text
+    assert '/static/styles.css?v=30' in page.text
+    assert '/static/measurement-ui.js?v=30' in page.text
+    assert '/static/profile.js?v=30' in page.text
+    assert '/static/director.js?v=30' in page.text
+    assert '/static/app.js?v=30' in page.text
+    assert '/static/technician.js?v=30' in page.text
     assert 'data-admin-page="sensor-replacements"' in page.text
     assert 'data-admin-page="backups"' in page.text
     assert 'id="director-app"' in page.text
@@ -59,13 +59,13 @@ def test_web_shell_uses_versioned_assets_and_root_service_worker(client):
     assert 'data-manager-page="performance"' in page.text
     assert 'data-manager-page="comparison"' in page.text
     assert 'id="manager-performance-kpis"' in page.text
-    worker = client.get("/service-worker.js?v=27")
+    worker = client.get("/service-worker.js?v=30")
     assert worker.status_code == 200
     assert worker.headers["service-worker-allowed"] == "/"
     assert worker.headers["cache-control"] == "no-cache"
-    assert "/static/measurement-ui.js?v=27" in worker.text
-    assert "/static/director.js?v=27" in worker.text
-    assert "/static/technician.js?v=27" in worker.text
+    assert "/static/measurement-ui.js?v=30" in worker.text
+    assert "/static/director.js?v=30" in worker.text
+    assert "/static/technician.js?v=30" in worker.text
 
 def test_login_and_machine_requires_auth(client):
     assert client.get("/api/machines").status_code == 401
@@ -737,6 +737,7 @@ def test_manager_manual_failure_creation_recovery_and_role_restrictions(client):
             "assigned_to_id": technician_id,
             "title": "Réparation panne de test",
             "description": "Diagnostiquer et rétablir l'équipement.",
+            "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
             "failure_id": failure["id"],
         },
     )
@@ -1377,6 +1378,7 @@ def test_manager_assigns_and_technician_updates_intervention_with_revision(clien
         "title": "Contrôle de la pompe",
         "description": "Vérifier le roulement et la température.",
         "priority": "high",
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
     })
     assert assigned.status_code == 201
     intervention = assigned.json()
@@ -1388,7 +1390,7 @@ def test_manager_assigns_and_technician_updates_intervention_with_revision(clien
         f"/api/interventions/{intervention['id']}",
         headers=technician,
         json={
-            "status": "in_progress",
+            "status": "accepted",
             "diagnosis": "Jeu anormal détecté.",
             "work_done": "Inspection visuelle effectuée.",
             "expected_revision": 1,
@@ -1397,7 +1399,9 @@ def test_manager_assigns_and_technician_updates_intervention_with_revision(clien
     )
     assert updated.status_code == 200
     assert updated.json()["revision"] == 2
-    assert updated.json()["status"] == "in_progress"
+    assert updated.json()["status"] == "accepted"
+    assert updated.json()["accepted_at"] is not None
+    assert updated.json()["completed_at"] is None
     repeated = client.patch(
         f"/api/interventions/{intervention['id']}",
         headers=technician,
@@ -1417,6 +1421,168 @@ def test_manager_assigns_and_technician_updates_intervention_with_revision(clien
     assert stale.status_code == 409
     assert client.get("/api/interventions", headers=technician).json()[0]["id"] == intervention["id"]
 
+
+def test_intervention_rejects_past_deadlines_and_records_acceptance_completion_times(client):
+    manager = auth(client, "manager")
+    technician = auth(client, "technician")
+    technician_id = client.get("/api/auth/me", headers=technician).json()["id"]
+
+    missing_deadline = client.post("/api/interventions", headers=manager, json={
+        "machine_id": "test-machine",
+        "assigned_to_id": technician_id,
+        "title": "Sans échéance",
+        "description": "Cette intervention ne doit pas être créée sans échéance.",
+    })
+    assert missing_deadline.status_code == 422
+
+    past = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    rejected = client.post("/api/interventions", headers=manager, json={
+        "machine_id": "test-machine",
+        "assigned_to_id": technician_id,
+        "title": "Échéance invalide",
+        "description": "Cette date est dans le passé.",
+        "due_at": past,
+    })
+    assert rejected.status_code == 422
+    assert "futures" in rejected.json()["detail"]
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    assigned = client.post("/api/interventions", headers=manager, json={
+        "machine_id": "test-machine",
+        "assigned_to_id": technician_id,
+        "title": "Inspection du moteur",
+        "description": "Contrôler le moteur et les roulements.",
+        "due_at": future,
+    })
+    assert assigned.status_code == 201
+    item = assigned.json()
+    intervention_id = item["id"]
+    assert item["accepted_at"] is None
+    assert item["completed_at"] is None
+
+    invalid_start = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "in_progress",
+        "expected_revision": 1,
+    })
+    assert invalid_start.status_code == 409
+
+    accepted = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "accepted",
+        "expected_revision": 1,
+    })
+    assert accepted.status_code == 200
+    accepted_at = accepted.json()["accepted_at"]
+    assert accepted_at is not None
+
+    started = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "in_progress",
+        "expected_revision": 2,
+    })
+    assert started.status_code == 200
+    assert started.json()["accepted_at"] == accepted_at
+
+    completed = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "completed",
+        "work_done": "Roulement contrôlé et nettoyé.",
+        "expected_revision": 3,
+    })
+    assert completed.status_code == 200
+    final_item = completed.json()
+    assert final_item["completed_at"] is not None
+    assert final_item["resolved_at"] is not None
+    accepted_dt = datetime.fromisoformat(accepted_at.replace("Z", "+00:00"))
+    completed_dt = datetime.fromisoformat(final_item["completed_at"].replace("Z", "+00:00"))
+    assert final_item["duration_minutes"] == max(0, int((completed_dt - accepted_dt).total_seconds() // 60))
+
+    past_update = client.patch(f"/api/interventions/{intervention_id}", headers=manager, json={
+        "due_at": past,
+        "expected_revision": 4,
+    })
+    assert past_update.status_code == 422
+    cleared_deadline = client.patch(f"/api/interventions/{intervention_id}", headers=manager, json={
+        "due_at": None,
+    })
+    assert cleared_deadline.status_code == 422
+
+
+def test_overdue_interventions_are_blocked_until_manager_sets_a_new_future_deadline(client):
+    manager = auth(client, "manager")
+    technician = auth(client, "technician")
+    technician_id = client.get("/api/auth/me", headers=technician).json()["id"]
+
+    created = client.post("/api/interventions", headers=manager, json={
+        "machine_id": "test-machine",
+        "assigned_to_id": technician_id,
+        "title": "Intervention à échéance dépassée",
+        "description": "Vérifier le blocage des interventions en retard.",
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+    })
+    assert created.status_code == 201
+    intervention_id = created.json()["id"]
+
+    # Simulate an already-existing task whose deadline has elapsed.
+    db = TestingSession()
+    try:
+        row = db.get(InterventionRow, intervention_id)
+        row.due_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        db.commit()
+    finally:
+        db.close()
+
+    accept = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "accepted",
+    })
+    assert accept.status_code == 409
+    assert "échéance est dépassée" in accept.json()["detail"]
+
+    update_work = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "work_done": "Tentative de travail après l’échéance.",
+    })
+    assert update_work.status_code == 409
+
+    # The manager can explicitly reschedule the task into the future.
+    rescheduled = client.patch(f"/api/interventions/{intervention_id}", headers=manager, json={
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat(),
+    })
+    assert rescheduled.status_code == 200
+
+    accepted = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "accepted",
+    })
+    assert accepted.status_code == 200
+    assert accepted.json()["accepted_at"] is not None
+
+    started = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "in_progress",
+    })
+    assert started.status_code == 200
+
+    # If the deadline passes while the task is in progress, completion is blocked
+    # until the manager gives it another future deadline.
+    db = TestingSession()
+    try:
+        row = db.get(InterventionRow, intervention_id)
+        row.due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+
+    completed = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "completed",
+        "work_done": "Travail terminé.",
+    })
+    assert completed.status_code == 409
+
+    renewed = client.patch(f"/api/interventions/{intervention_id}", headers=manager, json={
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    })
+    assert renewed.status_code == 200
+    completed = client.patch(f"/api/interventions/{intervention_id}", headers=technician, json={
+        "status": "completed",
+        "work_done": "Travail terminé après report de l’échéance.",
+    })
+    assert completed.status_code == 200
+    assert completed.json()["completed_at"] is not None
 
 def test_alert_acknowledgement_is_audited_and_critical_creates_failure(client):
     manager = auth(client, "manager")
@@ -1470,6 +1636,7 @@ def test_technician_can_record_calibration_and_notifications(client):
         "assigned_to_id": technician_id,
         "title": "Révision",
         "description": "Contrôler le capteur.",
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
     })
     assert assignment.status_code == 201
     notifications = client.get("/api/notifications", headers=technician).json()
@@ -1478,6 +1645,37 @@ def test_technician_can_record_calibration_and_notifications(client):
     marked = client.post(f"/api/notifications/{target['id']}/read", headers=technician)
     assert marked.status_code == 200
     assert next(item for item in client.get("/api/notifications", headers=technician).json() if item["id"] == target["id"])["read"]
+
+
+def test_manager_is_notified_when_technician_completes_intervention(client):
+    manager = auth(client, "manager")
+    technician = auth(client, "technician")
+    technician_id = client.get("/api/auth/me", headers=technician).json()["id"]
+    created = client.post("/api/interventions", headers=manager, json={
+        "machine_id": "test-machine",
+        "assigned_to_id": technician_id,
+        "title": "Notification responsable",
+        "description": "Le responsable doit être prévenu de la fin.",
+        "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+    }).json()
+    accepted = client.patch(f"/api/interventions/{created['id']}", headers=technician, json={"status": "accepted"})
+    assert accepted.status_code == 200
+    done = client.patch(f"/api/interventions/{created['id']}", headers=technician, json={
+        "status": "completed",
+        "work_done": "Travail terminé.",
+    })
+    assert done.status_code == 200
+    manager_notifications = client.get("/api/notifications", headers=manager).json()
+    progress = [item for item in manager_notifications if item["type"] == "intervention_progress"]
+    assert any("a terminé" in item["message"] for item in progress)
+    assert all(item["target_type"] == "intervention" and item["target_id"] == str(created["id"]) for item in progress)
+    # Le technicien n'est pas notifié de sa propre action.
+    technician_notifications = client.get("/api/notifications", headers=technician).json()
+    assert not any(item["type"] == "intervention_updated" for item in technician_notifications)
+    # Le directeur ne reçoit pas de notification : il consulte les dates dans son tableau.
+    director_notifications = client.get("/api/notifications", headers=auth(client, "director")).json()
+    assert not any(item["type"] == "intervention_completed" for item in director_notifications)
+    assert done.json()["completed_at"] is not None
 
 
 def test_password_reset_is_generic_hashed_single_use_and_revokes_sessions(client, monkeypatch):
@@ -1642,6 +1840,7 @@ def test_intervention_photos_are_persistent_validated_and_authorized(client, tmp
             "assigned_to_id": technician_id,
             "title": "Inspection photo",
             "description": "Ajouter une preuve visuelle",
+            "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
         },
     )
     assert created.status_code == 201
@@ -1666,6 +1865,23 @@ def test_intervention_photos_are_persistent_validated_and_authorized(client, tmp
     assert downloaded.status_code == 200
     assert downloaded.headers["content-type"] == "image/png"
     assert downloaded.content == png
+
+    # The manager must see the same photo uploaded by the assigned technician.
+    manager_listed = client.get(
+        f"/api/interventions/{intervention_id}/photos",
+        headers=auth(client, "manager"),
+    )
+    assert manager_listed.status_code == 200
+    assert len(manager_listed.json()) == 1
+    assert manager_listed.json()[0]["id"] == listed.json()[0]["id"]
+    manager_downloaded = client.get(
+        f"/api/interventions/{intervention_id}/photos/{manager_listed.json()[0]['id']}",
+        headers=auth(client, "manager"),
+    )
+    assert manager_downloaded.status_code == 200
+    assert manager_downloaded.headers["content-type"] == "image/png"
+    assert manager_downloaded.content == png
+
     assert client.get(
         f"/api/interventions/{intervention_id}/photos",
         headers=auth(client, "director"),
@@ -1690,6 +1906,7 @@ def test_intervention_photos_are_persistent_validated_and_authorized(client, tmp
             "assigned_to_id": other_technician_id,
             "title": "Privée pour un autre compte",
             "description": "Ne pas divulguer les photos",
+            "due_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
         },
     )
     assert other_intervention.status_code == 201

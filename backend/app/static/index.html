@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#1D3B3A">
   <title>PrediMaint — Maintenance prédictive</title>
-  <link rel="stylesheet" href="/static/styles.css?v=27">
+  <link rel="stylesheet" href="/static/styles.css?v=36">
 </head>
 <body>
   <main class="shell">
@@ -120,7 +120,7 @@
           <label>Panne confirmée associée<select name="failure_id" id="assignment-failure"><option value="">Aucune</option></select></label>
           <label>Intitulé<input name="title" required minlength="2" maxlength="200"></label>
           <label>Priorité<select name="priority"><option value="normal">Normale</option><option value="low">Basse</option><option value="high">Haute</option><option value="urgent">Urgente</option></select></label>
-          <label>Échéance<input name="due_at" type="datetime-local"></label>
+          <label>Échéance<input name="due_at" type="datetime-local" required><small class="muted">Obligatoire : choisissez une date et une heure futures.</small></label>
           <label class="span-two">Consignes<textarea name="description" rows="3" required minlength="3" maxlength="4000"></textarea></label>
           <button class="primary" type="submit">Attribuer au technicien</button>
           <p id="assignment-message" class="muted" role="status"></p>
@@ -310,13 +310,14 @@
         <section id="admin-page" class="admin-content" tabindex="-1"></section>
       </div>
     </section>
+    <div id="notification-toasts" class="notification-toasts" aria-live="polite" aria-relevant="additions"></div>
     <p id="toast" role="status" aria-live="polite"></p>
   </main>
-  <script src="/static/measurement-ui.js?v=27"></script>
-  <script src="/static/profile.js?v=27"></script>
-  <script src="/static/director.js?v=27"></script>
-  <script src="/static/app.js?v=27"></script>
-  <script src="/static/admin.js?v=27"></script>
-  <script src="/static/technician.js?v=27"></script>
+  <script src="/static/measurement-ui.js?v=36"></script>
+  <script src="/static/profile.js?v=36"></script>
+  <script src="/static/director.js?v=36"></script>
+  <script src="/static/app.js?v=36"></script>
+  <script src="/static/admin.js?v=36"></script>
+  <script src="/static/technician.js?v=36"></script>
 </body>
 </html>

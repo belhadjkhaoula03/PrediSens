@@ -1,13 +1,13 @@
-const CACHE_NAME = "predimaint-shell-v27";
+const CACHE_NAME = "predimaint-shell-v36";
 const APP_SHELL = [
   "/",
-  "/static/styles.css?v=27",
-  "/static/measurement-ui.js?v=27",
-  "/static/profile.js?v=27",
-  "/static/director.js?v=27",
-  "/static/app.js?v=27",
-  "/static/admin.js?v=27",
-  "/static/technician.js?v=27",
+  "/static/styles.css?v=36",
+  "/static/measurement-ui.js?v=36",
+  "/static/profile.js?v=36",
+  "/static/director.js?v=36",
+  "/static/app.js?v=36",
+  "/static/admin.js?v=36",
+  "/static/technician.js?v=36",
 ];
 
 self.addEventListener("install", (event) => {
