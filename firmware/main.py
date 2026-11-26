@@ -35,7 +35,7 @@ def connect_wifi(config):
     except Exception:
         pass
     wlan.active(True)
-    wlan.connect(config["wifi_ssid"], config["wifi_password"])
+    wlan.connect(config["TOPNET_7C1F"], config["STMVGP7G4NSA"])
     deadline = time.time() + 25
     while not wlan.isconnected() and time.time() < deadline:
         time.sleep_ms(250)
