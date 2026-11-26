@@ -1,0 +1,2 @@
+# libzstd1 - fix not yet in the Debian mirror, remove after the next image rebuild
+CVE-2026-124851
