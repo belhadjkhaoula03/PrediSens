@@ -12,7 +12,6 @@ stages:
   - security
   - build
   - image-scan
-#test
 # ---------- 1. LINT ----------
 lint:
   stage: lint
