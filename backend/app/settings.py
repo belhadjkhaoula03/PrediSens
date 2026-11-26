@@ -1,0 +1,33 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    database_url: str = "sqlite:///./predimaint.db"
+    jwt_secret: str = "development-only-change-me"
+    jwt_expire_minutes: int = 480
+    mqtt_host: str = "localhost"
+    mqtt_port: int = 1883
+    mqtt_username: str = ""
+    mqtt_password: str = ""
+    mqtt_enabled: bool = True
+    demo_tech_password: str = "change-tech-password"
+    demo_manager_password: str = "change-manager-password"
+    demo_director_password: str = "change-director-password"
+    demo_admin_email: str = "admin@predimaint.local"
+    demo_admin_password: str = "change-admin-password"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
+    public_base_url: str = "http://localhost:8001"
+    backup_directory: str = "/var/lib/predimaint/backups"
+    intervention_photo_directory: str = "/var/lib/predimaint/intervention-photos"
+    web_push_vapid_public_key: str = ""
+    web_push_vapid_private_key: str = ""
+    web_push_vapid_subject: str = ""
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+
+settings = Settings()
