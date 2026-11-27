@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: predimaint
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mosquitto}
+  template:
+    metadata:
+      labels: {app: mosquitto}
+    spec:
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2
+          envFrom:
+            - secretRef:
+                name: predimaint-env
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp /cfg/acl /mosquitto/data/acl &&
+              chown mosquitto:mosquitto /mosquitto/data/acl &&
+              chmod 0700 /mosquitto/data/acl &&
+              mosquitto_passwd -b -c /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD" &&
+              mosquitto_passwd -b /mosquitto/config/passwd "$MQTT_BACKEND_USERNAME" "$MQTT_BACKEND_PASSWORD" &&
+              chown mosquitto:mosquitto /mosquitto/config/passwd &&
+              chmod 0700 /mosquitto/config/passwd &&
+              exec mosquitto -c /cfg/mosquitto.conf
+          ports:
+            - containerPort: 1883
+          readinessProbe:
+            tcpSocket:
+              port: 1883
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          volumeMounts:
+            - name: cfg
+              mountPath: /cfg
+            - name: data
+              mountPath: /mosquitto/data
+      volumes:
+        - name: cfg
+          configMap:
+            name: mosquitto-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: predimaint
+spec:
+  selector: {app: mosquitto}
+  ports:
+    - port: 1883
+      targetPort: 1883

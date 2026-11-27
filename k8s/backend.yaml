@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backups
+  namespace: predimaint
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: intervention-photos
+  namespace: predimaint
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: predimaint
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: backend}
+  template:
+    metadata:
+      labels: {app: backend}
+    spec:
+      containers:
+        - name: backend
+          image: predimaint-backend:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: predimaint-env
+          env:
+            - name: MQTT_HOST
+              value: mosquitto
+            - name: MQTT_PORT
+              value: "1883"
+            - name: BACKUP_DIRECTORY
+              value: /var/lib/predimaint/backups
+            - name: MQTT_USERNAME
+              valueFrom:
+                secretKeyRef: {name: predimaint-env, key: MQTT_BACKEND_USERNAME}
+            - name: MQTT_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: predimaint-env, key: MQTT_BACKEND_PASSWORD}
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - name: backups
+              mountPath: /var/lib/predimaint/backups
+            - name: photos
+              mountPath: /var/lib/predimaint/intervention-photos
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: backups
+        - name: photos
+          persistentVolumeClaim:
+            claimName: intervention-photos
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: predimaint
+spec:
+  selector: {app: backend}
+  ports:
+    - port: 8000
+      targetPort: 8000
